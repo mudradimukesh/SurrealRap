@@ -1025,6 +1025,18 @@ class _FormattedPageView extends StatelessWidget {
   }
 }
 
+class _PositionedPdfLine {
+  const _PositionedPdfLine({
+    required this.line,
+    required this.top,
+    required this.fontSize,
+  });
+
+  final ImportedTextLine line;
+  final double top;
+  final double fontSize;
+}
+
 class _PdfPageCanvas extends StatelessWidget {
   const _PdfPageCanvas({
     required this.page,
@@ -1040,7 +1052,12 @@ class _PdfPageCanvas extends StatelessWidget {
   Widget build(BuildContext context) {
     final pageWidth = page.width <= 0 ? 612.0 : page.width;
     final pageHeight = page.height <= 0 ? 792.0 : page.height;
-    final fontScale = _pdfFontScale(lines);
+    final renderLines = _normalizePdfLineStyles(
+      _repairPdfLineTexts(_withSyntheticDropCaps(lines)),
+      pageWidth,
+    );
+    final fontScale = _pdfFontScale(renderLines);
+    final bodyFontSize = _bodyFontSize(renderLines);
 
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -1048,7 +1065,18 @@ class _PdfPageCanvas extends StatelessWidget {
             ? constraints.maxWidth
             : pageWidth;
         final scale = canvasWidth / pageWidth;
-        final canvasHeight = pageHeight * scale;
+        final positionedLines = _positionedPdfLines(
+          renderLines,
+          scale,
+          fontScale,
+          bodyFontSize,
+          pageWidth,
+        );
+        final contentBottom = positionedLines.fold<double>(
+          0,
+          (bottom, entry) => math.max(bottom, entry.top + entry.fontSize),
+        );
+        final canvasHeight = math.max(pageHeight * scale, contentBottom + 24);
 
         return SizedBox(
           width: canvasWidth,
@@ -1058,25 +1086,25 @@ class _PdfPageCanvas extends StatelessWidget {
             child: Stack(
               clipBehavior: Clip.none,
               children: [
-                for (final line in lines)
+                for (final entry in positionedLines)
                   Positioned(
-                    left: line.left * scale,
-                    top: line.top * scale,
-                    width: _lineWidth(line, pageWidth) * scale,
+                    left: entry.line.left * scale,
+                    top: entry.top,
+                    width: _lineWidth(entry.line, pageWidth) * scale,
                     child: Text(
-                      line.text,
+                      entry.line.text,
                       maxLines: 1,
                       overflow: TextOverflow.visible,
                       softWrap: false,
                       style: TextStyle(
                         color: colors.foreground,
-                        fontFamily: _originalPdfFontFamily(line.fontName),
-                        fontSize: _pdfLineFontSize(line, scale, fontScale),
+                        fontFamily: _originalPdfFontFamily(entry.line.fontName),
+                        fontSize: entry.fontSize,
                         height: 1,
-                        fontWeight: line.bold
+                        fontWeight: entry.line.bold
                             ? FontWeight.w700
                             : FontWeight.w400,
-                        fontStyle: line.italic
+                        fontStyle: entry.line.italic
                             ? FontStyle.italic
                             : FontStyle.normal,
                       ),
@@ -1090,6 +1118,123 @@ class _PdfPageCanvas extends StatelessWidget {
     );
   }
 
+  List<ImportedTextLine> _repairPdfLineTexts(List<ImportedTextLine> lines) {
+    return [
+      for (final line in lines)
+        ImportedTextLine(
+          text: _repairRenderedPdfText(line.text),
+          fontName: line.fontName,
+          fontSize: line.fontSize,
+          bold: line.bold,
+          italic: line.italic,
+          left: line.left,
+          top: line.top,
+          width: line.width,
+        ),
+    ];
+  }
+
+  String _repairRenderedPdfText(String text) {
+    var repaired = text
+        .replaceAll('Õ', '’')
+        .replaceAll('Ò', '“')
+        .replaceAll('Ó', '”')
+        .replaceAll('Ô', '‘')
+        .replaceAll('Ñ', '—')
+        .replaceAll('Ð', '–')
+        .replaceAll('„', '”')
+        .replaceAll('˜', '')
+        .replaceAll('ﬀ', 'ff')
+        .replaceAll('ﬁ', 'fi')
+        .replaceAll('ﬂ', 'fl')
+        .replaceAll('ﬃ', 'ffi')
+        .replaceAll('ﬄ', 'ffl')
+        .replaceAllMapped(
+          RegExp(r'(^|\n)[“"]\s*[”"]\s+(?=[A-Z])'),
+          (match) => '${match.group(1)}” ',
+        )
+        .replaceAllMapped(RegExp(r'\s+[~]\s+(?=[A-Z])'), (_) => ' ')
+        .replaceAllMapped(
+          RegExp(r'\b([A-Za-z]{2,})\s+ff\s+(ed|ing|s|er|ers)\b'),
+          (match) => '${match.group(1)}ff${match.group(2)}',
+        )
+        .replaceAllMapped(
+          RegExp(r"([A-Za-z])([’'])\s+(t|s|re|ve|ll|d|m)\b"),
+          (match) => '${match.group(1)}${match.group(2)}${match.group(3)}',
+        );
+
+    const replacements = {
+      'sco ff ed': 'scoffed',
+      'Sco ff ed': 'Scoffed',
+      'couldn’ t': 'couldn’t',
+      "couldn' t": "couldn't",
+    };
+    for (final entry in replacements.entries) {
+      repaired = repaired.replaceAll(entry.key, entry.value);
+    }
+    return repaired;
+  }
+
+  List<_PositionedPdfLine> _positionedPdfLines(
+    List<ImportedTextLine> lines,
+    double scale,
+    double fontScale,
+    double bodyFontSize,
+    double pageWidth,
+  ) {
+    final positioned =
+        [
+          for (final line in lines)
+            _PositionedPdfLine(
+              line: line,
+              top: line.top * scale,
+              fontSize: _pdfLineFontSize(
+                line,
+                scale,
+                fontScale,
+                bodyFontSize,
+                pageWidth,
+              ),
+            ),
+        ]..sort((a, b) {
+          final top = a.top.compareTo(b.top);
+          return top == 0 ? a.line.left.compareTo(b.line.left) : top;
+        });
+
+    var floor = 0.0;
+    return [
+      for (final entry in positioned)
+        _positionedWithoutCollision(entry, pageWidth, () {
+          final adjustedTop = math.max(entry.top, floor);
+          floor = adjustedTop + entry.fontSize * 1.18;
+          return adjustedTop;
+        }),
+    ];
+  }
+
+  _PositionedPdfLine _positionedWithoutCollision(
+    _PositionedPdfLine entry,
+    double pageWidth,
+    double Function() nextBodyTop,
+  ) {
+    final text = entry.line.text.trim();
+    final isDropCap = _isDropCapLine(text, entry.fontSize);
+    if (isDropCap) {
+      return entry;
+    }
+
+    final isHeading = _isLikelyHeadingLine(entry.line, pageWidth);
+    if (isHeading) {
+      return entry;
+    }
+
+    return _PositionedPdfLine(
+      line: entry.line,
+      top: nextBodyTop(),
+      fontSize: entry.fontSize,
+    );
+  }
+
   double _lineWidth(ImportedTextLine line, double pageWidth) {
     final remaining = math.max(48.0, pageWidth - line.left);
     if (line.width <= 0) {
@@ -1098,15 +1243,312 @@ class _PdfPageCanvas extends StatelessWidget {
     return math.min(remaining, math.max(line.width * 1.12, 32.0));
   }
 
+  List<ImportedTextLine> _withSyntheticDropCaps(
+    List<ImportedTextLine> sourceLines,
+  ) {
+    final bodyFontSize = _bodyFontSize(sourceLines);
+    final normalizedLines = _normalizeImportedDropCaps(
+      sourceLines,
+      bodyFontSize,
+    );
+    var synthesized = false;
+    double? dropLeft;
+    double? dropRight;
+    double? dropTop;
+    double? dropBottom;
+    final result = <ImportedTextLine>[];
+
+    for (final line in normalizedLines) {
+      final split = _splitFusedDropCap(line, bodyFontSize);
+      if (!synthesized && split != null) {
+        final dropCap = split.first;
+        final textLine = split[1];
+        dropLeft = dropCap.left;
+        dropRight = textLine.left;
+        dropTop = dropCap.top;
+        dropBottom = dropCap.top + dropCap.fontSize * 1.05;
+        result.addAll(split);
+        synthesized = true;
+      } else if (_overlapsDropCapColumn(
+        line,
+        dropLeft,
+        dropRight,
+        dropTop,
+        dropBottom,
+      )) {
+        final targetLeft = dropRight!;
+        final shift = targetLeft - line.left;
+        result.add(
+          ImportedTextLine(
+            text: line.text,
+            fontName: line.fontName,
+            fontSize: line.fontSize,
+            bold: line.bold,
+            italic: line.italic,
+            left: targetLeft,
+            top: line.top,
+            width: line.width <= 0
+                ? line.width
+                : math.max(24, line.width - shift),
+          ),
+        );
+      } else {
+        result.add(line);
+      }
+    }
+    return result;
+  }
+
+  List<ImportedTextLine> _normalizeImportedDropCaps(
+    List<ImportedTextLine> sourceLines,
+    double bodyFontSize,
+  ) {
+    final result = <ImportedTextLine>[];
+    var skipNext = false;
+
+    for (var index = 0; index < sourceLines.length; index++) {
+      if (skipNext) {
+        skipNext = false;
+        continue;
+      }
+
+      final line = sourceLines[index];
+      final next = index + 1 < sourceLines.length
+          ? sourceLines[index + 1]
+          : null;
+      if (_isStandaloneDropCapFragment(line, bodyFontSize) &&
+          next != null &&
+          _shouldKeepStandaloneDropCap(line, next)) {
+        final dropSize = math.max(line.fontSize, bodyFontSize * 3.55);
+        final reservedWidth = math.max(bodyFontSize * 1.25, dropSize * 0.28);
+        result.add(
+          ImportedTextLine(
+            text: line.text,
+            fontName: line.fontName,
+            fontSize: dropSize,
+            bold: line.bold,
+            italic: line.italic,
+            left: math.max(
+              0.0,
+              next.left - reservedWidth - bodyFontSize * 0.28,
+            ),
+            top: next.top - bodyFontSize * 0.5,
+            width: reservedWidth,
+          ),
+        );
+        result.add(next);
+        skipNext = true;
+      } else if (_isStandaloneDropCapFragment(line, bodyFontSize) &&
+          next != null) {
+        final initial = line.text.trim();
+        final nextText = next.text.trimLeft();
+        final joiner = nextText.startsWith("'") ? '' : ' ';
+        result.add(
+          ImportedTextLine(
+            text: '$initial$joiner$nextText',
+            fontName: next.fontName,
+            fontSize: next.fontSize,
+            bold: next.bold,
+            italic: next.italic,
+            left: next.left,
+            top: next.top,
+            width: next.width,
+          ),
+        );
+        skipNext = true;
+      } else {
+        result.add(line);
+      }
+    }
+
+    return result;
+  }
+
+  bool _isStandaloneDropCapFragment(
+    ImportedTextLine line,
+    double bodyFontSize,
+  ) {
+    final text = line.text.trim();
+    return text.length == 1 &&
+        RegExp(r'[A-Za-z]').hasMatch(text) &&
+        line.fontSize >= math.max(18, bodyFontSize * 1.8);
+  }
+
+  bool _shouldKeepStandaloneDropCap(
+    ImportedTextLine dropCap,
+    ImportedTextLine continuation,
+  ) {
+    final initial = dropCap.text.trim();
+    final text = continuation.text.trimLeft();
+    if (initial == 'I') {
+      return _isOriginalOpeningContinuation(continuation);
+    }
+    return RegExp(r'^[a-z]').hasMatch(text);
+  }
+
+  bool _isOriginalOpeningContinuation(ImportedTextLine line) {
+    return line.text.trimLeft().toLowerCase().startsWith('was meant ');
+  }
+
+  List<ImportedTextLine> _normalizePdfLineStyles(
+    List<ImportedTextLine> sourceLines,
+    double pageWidth,
+  ) {
+    final bodyFontSize = _bodyFontSize(sourceLines);
+    return [
+      for (final line in sourceLines)
+        if (_shouldNormalizeAsBodyLine(line, bodyFontSize, pageWidth))
+          ImportedTextLine(
+            text: line.text,
+            fontName: line.fontName,
+            fontSize: _bodyLineFontSize(line, bodyFontSize),
+            bold: line.bold,
+            italic: line.italic,
+            left: line.left,
+            top: line.top,
+            width: line.width,
+          )
+        else
+          line,
+    ];
+  }
+
+  bool _shouldNormalizeAsBodyLine(
+    ImportedTextLine line,
+    double bodyFontSize,
+    double pageWidth,
+  ) {
+    final text = line.text.trim();
+    if (text.isEmpty ||
+        bodyFontSize <= 0 ||
+        _isDropCapLine(text, line.fontSize) ||
+        _isLikelyHeadingLine(line, pageWidth)) {
+      return false;
+    }
+
+    final isOutlier =
+        line.fontSize > bodyFontSize * 1.45 ||
+        line.fontSize < bodyFontSize * 0.65;
+    return isOutlier && _isBodyLikeText(text);
+  }
+
+  double _bodyLineFontSize(ImportedTextLine line, double bodyFontSize) {
+    if (line.bold && line.fontSize > bodyFontSize * 1.1) {
+      return math.min(line.fontSize, bodyFontSize * 1.18);
+    }
+    return bodyFontSize;
+  }
+
+  bool _isLikelyHeadingLine(ImportedTextLine line, double pageWidth) {
+    final text = line.text.trim();
+    final words = _wordsIn(text).toList();
+    if (text.isEmpty ||
+        words.length > 7 ||
+        text.length > 48 ||
+        _hasSentencePunctuation(text)) {
+      return false;
+    }
+
+    final center = line.left + line.width / 2;
+    final centered =
+        pageWidth > 0 && (center - pageWidth / 2).abs() < pageWidth * 0.22;
+    final letters = text.replaceAll(RegExp(r'[^A-Za-z]'), '');
+    final uppercaseLetters = letters.replaceAll(RegExp(r'[^A-Z]'), '').length;
+    final mostlyUppercase =
+        letters.isNotEmpty && uppercaseLetters / letters.length > 0.42;
+    final titleCase = words.isNotEmpty && words.every(_looksTitleCased);
+
+    return centered || mostlyUppercase || titleCase;
+  }
+
+  bool _overlapsDropCapColumn(
+    ImportedTextLine line,
+    double? dropLeft,
+    double? dropRight,
+    double? dropTop,
+    double? dropBottom,
+  ) {
+    if (dropLeft == null ||
+        dropRight == null ||
+        dropTop == null ||
+        dropBottom == null) {
+      return false;
+    }
+    final sameVerticalBand = line.top >= dropTop && line.top <= dropBottom;
+    final startsUnderDropCap =
+        line.left < dropRight && line.left >= dropLeft - 2;
+    return sameVerticalBand && startsUnderDropCap;
+  }
+
+  List<ImportedTextLine>? _splitFusedDropCap(
+    ImportedTextLine line,
+    double bodyFontSize,
+  ) {
+    final text = line.text.trimLeft();
+    final match = RegExp(r'^([A-Z])([a-z]+)(\b.*)$').firstMatch(text);
+    if (match == null || text.split(RegExp(r'\s+')).length < 3) {
+      return null;
+    }
+
+    final initial = match.group(1) ?? '';
+    final fusedWord = match.group(2) ?? '';
+    final tail = match.group(3) ?? '';
+    if (initial != 'I' ||
+        fusedWord != 'was' ||
+        !tail.trimLeft().toLowerCase().startsWith('meant ')) {
+      return null;
+    }
+
+    final dropSize = math.max(line.fontSize * 3.55, bodyFontSize * 3.55);
+    final reservedWidth = math.max(bodyFontSize * 1.25, dropSize * 0.28);
+    final dropLeft = math.max(
+      0.0,
+      line.left - reservedWidth - bodyFontSize * 0.28,
+    );
+    final restLeft = line.left;
+    final restText = '$fusedWord$tail'.trimLeft();
+    final dropTop = line.top - bodyFontSize * 0.5;
+
+    return [
+      ImportedTextLine(
+        text: initial,
+        fontName: line.fontName,
+        fontSize: dropSize,
+        bold: line.bold,
+        italic: line.italic,
+        left: dropLeft,
+        top: dropTop,
+        width: reservedWidth,
+      ),
+      ImportedTextLine(
+        text: restText,
+        fontName: line.fontName,
+        fontSize: line.fontSize,
+        bold: line.bold,
+        italic: line.italic,
+        left: restLeft,
+        top: line.top,
+        width: line.width,
+      ),
+    ];
+  }
+
   double _pdfLineFontSize(
     ImportedTextLine line,
     double scale,
     double fallbackScale,
+    double bodyFontSize,
+    double pageWidth,
   ) {
     final text = line.text.trim();
     final targetWidth = line.width * scale;
     if (text.isEmpty || targetWidth <= 4) {
       return math.max(8, line.fontSize * scale * fallbackScale);
+    }
+
+    final extractedSize = line.fontSize * scale * fallbackScale;
+    if (_isDropCapLine(text, extractedSize)) {
+      return math.max(30, extractedSize);
     }
 
     final fontFamily = _originalPdfFontFamily(line.fontName);
@@ -1138,29 +1580,125 @@ class _PdfPageCanvas extends StatelessWidget {
       }
     }
 
-    final extractedSize = line.fontSize * scale * fallbackScale;
-    return math.max(8, math.max(low, extractedSize * 0.82));
+    final fittedSize = math.max(8.0, low);
+    final scaledBodySize = math.max(8.0, bodyFontSize * scale * fallbackScale);
+    if (_isLikelyHeadingLine(line, pageWidth)) {
+      return math.min(fittedSize, _headingFontCap(line, scaledBodySize));
+    }
+
+    if (_isBodyLikeText(text)) {
+      return math.min(fittedSize, scaledBodySize * (line.bold ? 1.08 : 1.0));
+    }
+
+    return math.min(fittedSize, scaledBodySize * 1.2);
+  }
+
+  double _headingFontCap(ImportedTextLine line, double scaledBodySize) {
+    final words = _wordsIn(line.text.trim()).toList();
+    if (line.text.trim().length <= 12 && words.length <= 2) {
+      return scaledBodySize * 8.0;
+    }
+    return scaledBodySize * 1.9;
+  }
+
+  bool _isBodyLikeText(String text) {
+    final words = _wordsIn(text).toList();
+    if (words.length < 4) {
+      return false;
+    }
+    final normalized = text.replaceFirst(RegExp("^[“\"‘']+"), '');
+    final startsLikeSentence =
+        normalized.isNotEmpty && normalized[0] == normalized[0].toLowerCase();
+    return text.length > 26 ||
+        _hasSentencePunctuation(text) ||
+        startsLikeSentence;
+  }
+
+  Iterable<String> _wordsIn(String text) {
+    return text.split(RegExp(r'\s+')).where((word) => word.trim().isNotEmpty);
+  }
+
+  bool _hasSentencePunctuation(String text) {
+    return RegExp(r'[,.!?;:]').hasMatch(text);
+  }
+
+  bool _looksTitleCased(String word) {
+    final letters = word.replaceAll(RegExp(r'[^A-Za-z]'), '');
+    if (letters.isEmpty) {
+      return false;
+    }
+    return letters[0] == letters[0].toUpperCase();
+  }
+
+  bool _isDropCapLine(String text, double extractedSize) {
+    return text.length == 1 &&
+        RegExp(r'[A-Za-z]').hasMatch(text) &&
+        extractedSize >= 24;
   }
 
   double _pdfFontScale(List<ImportedTextLine> lines) {
-    final bodySizes =
-        lines
-            .where((line) => line.text.trim().length > 12)
-            .map((line) => line.fontSize)
-            .where((size) => size > 0)
-            .toList()
-          ..sort();
+    final bodySizes = _bodyFontSizes(lines);
     if (bodySizes.isEmpty) {
       return 1;
     }
     final referenceSize = bodySizes[bodySizes.length ~/ 2];
-    return (14 / referenceSize).clamp(0.9, 8.0).toDouble();
+    return (24 / referenceSize).clamp(1.0, 8.0).toDouble();
+  }
+
+  double _bodyFontSize(List<ImportedTextLine> lines) {
+    final sizes = _bodyFontSizes(lines);
+    if (sizes.isEmpty) {
+      return 12;
+    }
+    return sizes[sizes.length ~/ 2];
+  }
+
+  List<double> _bodyFontSizes(List<ImportedTextLine> lines) {
+    final sizes =
+        lines
+            .where((line) => _isBodyLikeText(line.text.trim()))
+            .map((line) => line.fontSize)
+            .where((size) => size > 0)
+            .toList()
+          ..sort();
+    if (sizes.isEmpty) {
+      return const [];
+    }
+    if (sizes.length == 1 && sizes.single > 24) {
+      return const [12];
+    }
+
+    final referenceSize = sizes[(sizes.length - 1) ~/ 2];
+    final filtered = sizes
+        .where(
+          (size) =>
+              size >= referenceSize * 0.55 && size <= referenceSize * 1.55,
+        )
+        .toList();
+    return filtered.isEmpty ? sizes : filtered;
   }
 
   String? _originalPdfFontFamily(String originalFontName) {
     final font = originalFontName.trim();
-    if (font.isNotEmpty && font != 'Original') {
-      return font;
+    if (font.isEmpty || font == 'Original') {
+      return 'Arial';
+    }
+
+    final lower = font.toLowerCase();
+    if (lower.contains('times')) {
+      return 'Times New Roman';
+    }
+    if (lower.contains('courier')) {
+      return 'Courier New';
+    }
+    if (lower.contains('helvetica') || lower.contains('arial')) {
+      return 'Arial';
+    }
+    if (lower.contains('georgia')) {
+      return 'Georgia';
+    }
+    if (lower.contains('avenir')) {
+      return 'Avenir Next';
     }
     return 'Arial';
   }

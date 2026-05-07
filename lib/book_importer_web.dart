@@ -251,9 +251,10 @@ List<ImportedTextLine> _mergeVisualLines(List<ImportedTextLine> lines) {
     }
   }
 
+  final bodyFontSize = _referenceBodyFontSize(sorted);
   final merged =
       groups
-          .map(_mergeVisualLine)
+          .expand((group) => _mergeVisualGroup(group, bodyFontSize))
           .where((line) => line.text.trim().isNotEmpty)
           .toList()
         ..sort((a, b) {
@@ -261,6 +262,49 @@ List<ImportedTextLine> _mergeVisualLines(List<ImportedTextLine> lines) {
           return top == 0 ? a.left.compareTo(b.left) : top;
         });
   return merged;
+}
+
+List<ImportedTextLine> _mergeVisualGroup(
+  List<ImportedTextLine> group,
+  double bodyFontSize,
+) {
+  final parts = [...group]..sort((a, b) => a.left.compareTo(b.left));
+  final dropCaps = parts
+      .where((line) => _isDropCapFragment(line, bodyFontSize, parts))
+      .toList();
+  if (dropCaps.isEmpty) {
+    return [_mergeVisualLine(parts)];
+  }
+
+  final remaining = parts
+      .where((line) => !dropCaps.contains(line))
+      .toList(growable: false);
+  return [...dropCaps, if (remaining.isNotEmpty) _mergeVisualLine(remaining)];
+}
+
+bool _isDropCapFragment(
+  ImportedTextLine line,
+  double bodyFontSize,
+  List<ImportedTextLine> group,
+) {
+  final text = line.text.trim();
+  if (group.length <= 1 ||
+      text.length != 1 ||
+      !RegExp(r'[A-Za-z]').hasMatch(text) ||
+      line.fontSize < math.max(18, bodyFontSize * 1.8)) {
+    return false;
+  }
+
+  final followingText = group
+      .where((part) => part.left > line.left)
+      .map((part) => part.text.trim())
+      .where((part) => part.isNotEmpty)
+      .join(' ')
+      .toLowerCase();
+  if (text == 'I') {
+    return followingText.startsWith('was meant ');
+  }
+  return RegExp(r'^[a-z]').hasMatch(followingText);
 }
 
 ImportedTextLine _mergeVisualLine(List<ImportedTextLine> group) {
@@ -370,6 +414,20 @@ double _referenceFontSize(List<ImportedTextLine> lines) {
   return sizes[sizes.length ~/ 2];
 }
 
+double _referenceBodyFontSize(List<ImportedTextLine> lines) {
+  final sizes =
+      lines
+          .where((line) => line.text.trim().length > 8)
+          .map((line) => line.fontSize)
+          .where((size) => size > 0)
+          .toList()
+        ..sort();
+  if (sizes.isEmpty) {
+    return _referenceFontSize(lines);
+  }
+  return sizes[sizes.length ~/ 2];
+}
+
 String _dominantFontName(List<ImportedTextLine> parts) {
   final fonts = <String, int>{};
   for (final part in parts) {
@@ -456,6 +514,13 @@ String _repairExtractedPdfText(String text) {
       .replaceAll('Ô', '‘')
       .replaceAll('Ñ', '—')
       .replaceAll('Ð', '–')
+      .replaceAll('„', '”')
+      .replaceAll('˜', '')
+      .replaceAllMapped(
+        RegExp(r'(^|\n)[“"]\s*[”"]\s+(?=[A-Z])'),
+        (match) => '${match.group(1)}” ',
+      )
+      .replaceAllMapped(RegExp(r'\s+[~]\s+(?=[A-Z])'), (_) => ' ')
       .replaceAll('Þ', 'fi')
       .replaceAll('þ', 'fl')
       .replaceAll('ﬀ', 'ff')
@@ -470,6 +535,10 @@ String _repairExtractedPdfText(String text) {
       .replaceAllMapped(
         RegExp(r"([A-Za-z])([’'])\s+(t|s|re|ve|ll|d|m)\b"),
         (match) => '${match.group(1)}${match.group(2)}${match.group(3)}',
+      )
+      .replaceAllMapped(
+        RegExp(r'\b([A-Za-z]{2,})\s+ff\s+(ed|ing|s|er|ers)\b'),
+        (match) => '${match.group(1)}ff${match.group(2)}',
       )
       .replaceAllMapped(
         RegExp(r'\b([A-Za-z][a-z]{2,})\s+([a-z]{2,})\b'),
@@ -514,6 +583,8 @@ String _repairKnownBrokenPdfWords(String text) {
     'Thr ee': 'Three',
     'couldn’ t': 'couldn’t',
     "couldn' t": "couldn't",
+    'sco ff ed': 'scoffed',
+    'Sco ff ed': 'Scoffed',
   };
 
   for (final entry in replacements.entries) {
