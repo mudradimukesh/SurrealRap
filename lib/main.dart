@@ -1142,8 +1142,42 @@ class _PdfPageCanvas extends StatelessWidget {
         .replaceAll('Ô', '‘')
         .replaceAll('Ñ', '—')
         .replaceAll('Ð', '–')
-        .replaceAll('„', '”')
         .replaceAll('˜', '')
+        .replaceAllMapped(
+          RegExp(
+            r'^[“”"\s]*(Was that five dollars worth all this\?)[”"\s]*(?=\s*$)',
+            caseSensitive: false,
+          ),
+          (match) => '“${match.group(1)}”',
+        )
+        .replaceAllMapped(
+          RegExp(
+            r'^[“”"\s]*(Was that five dollars worth all this\?)[”"\s]+(?=Rapsy\b)',
+            caseSensitive: false,
+          ),
+          (match) => '“${match.group(1)}” ',
+        )
+        .replaceAllMapped(
+          RegExp(
+            r'(“Was that five dollars worth all this\?”)\s+Rapsy scoffed, dripping with sarcasm\.?',
+            caseSensitive: false,
+          ),
+          (match) =>
+              '${match.group(1)} “Rapsy scoffed, dripping with sarcasm.”',
+        )
+        .replaceAllMapped(
+          RegExp(
+            r'^Rapsy scoffed, dripping with sarcasm\.?$',
+            caseSensitive: false,
+          ),
+          (_) => '“Rapsy scoffed, dripping with sarcasm.”',
+        )
+        .replaceAllMapped(RegExp(r'^[”"“]\s*(?=Rapsy\b)'), (_) => '')
+        .replaceAllMapped(RegExp(r'[„~]\s*(?=Rapsy\b)'), (_) => '')
+        .replaceAllMapped(
+          RegExp(r'^[—–-]{1,2}\s*(?=but\s+STILL!?\b)'),
+          (_) => '—',
+        )
         .replaceAll('ﬀ', 'ff')
         .replaceAll('ﬁ', 'fi')
         .replaceAll('ﬂ', 'fl')
@@ -1153,9 +1187,11 @@ class _PdfPageCanvas extends StatelessWidget {
           RegExp(r'(^|\n)[“"]\s*[”"]\s+(?=[A-Z])'),
           (match) => '${match.group(1)}” ',
         )
-        .replaceAllMapped(RegExp(r'\s+[~]\s+(?=[A-Z])'), (_) => ' ')
+        .replaceAllMapped(RegExp(r'\s+[„~]\s+(?=[A-Z])'), (_) => ' ')
         .replaceAllMapped(
-          RegExp(r'\b([A-Za-z]{2,})\s+ff\s+(ed|ing|s|er|ers)\b'),
+          RegExp(
+            r'\b([A-Za-z]{2,})[\s\u00A0]+f+[\s\u00A0]+(ed|ing|s|er|ers)\b',
+          ),
           (match) => '${match.group(1)}ff${match.group(2)}',
         )
         .replaceAllMapped(
@@ -1163,12 +1199,7 @@ class _PdfPageCanvas extends StatelessWidget {
           (match) => '${match.group(1)}${match.group(2)}${match.group(3)}',
         );
 
-    const replacements = {
-      'sco ff ed': 'scoffed',
-      'Sco ff ed': 'Scoffed',
-      'couldn’ t': 'couldn’t',
-      "couldn' t": "couldn't",
-    };
+    const replacements = {'couldn’ t': 'couldn’t', "couldn' t": "couldn't"};
     for (final entry in replacements.entries) {
       repaired = repaired.replaceAll(entry.key, entry.value);
     }
