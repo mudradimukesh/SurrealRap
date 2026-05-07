@@ -3,7 +3,6 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 
 import 'book_importer.dart';
-import 'original_pdf_view.dart';
 
 void main() {
   runApp(const SurrealRapApp());
@@ -857,19 +856,13 @@ class _ReadingPane extends StatelessWidget {
               ],
             ),
             const SizedBox(height: 22),
-            if (_canShowOriginalPdf(book))
-              OriginalPdfPageView(
-                sourceUrl: book.sourceUrl!,
-                pageIndex: clampedPage,
-              )
-            else
-              _FormattedPageView(
-                page: currentPage,
-                colors: colors,
-                baseFontSize: fontSize,
-                lineHeight: lineHeight,
-                fontFamily: fontFamily,
-              ),
+            _FormattedPageView(
+              page: currentPage,
+              colors: colors,
+              baseFontSize: fontSize,
+              lineHeight: lineHeight,
+              fontFamily: fontFamily,
+            ),
             const SizedBox(height: 20),
             Slider(
               value: clampedPage.toDouble(),
@@ -895,13 +888,6 @@ class _ReadingPane extends StatelessWidget {
         ),
       ),
     );
-  }
-
-  bool _canShowOriginalPdf(Book book) {
-    final sourceUrl = book.sourceUrl;
-    return book.format.toUpperCase() == 'PDF' &&
-        sourceUrl != null &&
-        sourceUrl.isNotEmpty;
   }
 
   String _chapterTitleFor(String text, int pageIndex) {
@@ -945,15 +931,7 @@ class _FormattedPageView extends StatelessWidget {
         ? _plainLinesFor(page.text)
         : page.lines.where((line) => line.text.trim().isNotEmpty).toList();
     if (_hasOriginalPageGeometry(lines)) {
-      return _PdfPageCanvas(
-        page: page,
-        lines: lines,
-        colors: colors,
-        baseFontSize: baseFontSize,
-        lineHeight: lineHeight,
-        fontFamily: fontFamily,
-        resolvedFontFamily: _resolvedFontFamily,
-      );
+      return _PdfPageCanvas(page: page, lines: lines, colors: colors);
     }
 
     final referenceSize = _referenceFontSize(lines);
@@ -1052,29 +1030,17 @@ class _PdfPageCanvas extends StatelessWidget {
     required this.page,
     required this.lines,
     required this.colors,
-    required this.baseFontSize,
-    required this.lineHeight,
-    required this.fontFamily,
-    required this.resolvedFontFamily,
   });
 
   final ImportedBookPage page;
   final List<ImportedTextLine> lines;
   final _ReaderColors colors;
-  final double baseFontSize;
-  final double lineHeight;
-  final String fontFamily;
-  final String? Function(String originalFontName, String selected)
-  resolvedFontFamily;
 
   @override
   Widget build(BuildContext context) {
     final pageWidth = page.width <= 0 ? 612.0 : page.width;
     final pageHeight = page.height <= 0 ? 792.0 : page.height;
-    final referenceSize = _referenceFontSize(lines);
-    final userScale = referenceSize <= 0
-        ? 1.0
-        : (baseFontSize / referenceSize).clamp(0.7, 2.2);
+    final fontScale = _pdfFontScale(lines);
 
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -1087,32 +1053,37 @@ class _PdfPageCanvas extends StatelessWidget {
         return SizedBox(
           width: canvasWidth,
           height: canvasHeight,
-          child: Stack(
-            clipBehavior: Clip.none,
-            children: [
-              for (final line in lines)
-                Positioned(
-                  left: line.left * scale,
-                  top: line.top * scale,
-                  width: _lineWidth(line, pageWidth) * scale,
-                  child: Text(
-                    line.text,
-                    maxLines: _maxLinesFor(line),
-                    overflow: TextOverflow.visible,
-                    softWrap: true,
-                    style: TextStyle(
-                      color: colors.foreground,
-                      fontFamily: resolvedFontFamily(line.fontName, fontFamily),
-                      fontSize: math.max(1, line.fontSize * scale * userScale),
-                      height: math.max(1, lineHeight * 0.78),
-                      fontWeight: line.bold ? FontWeight.w700 : FontWeight.w400,
-                      fontStyle: line.italic
-                          ? FontStyle.italic
-                          : FontStyle.normal,
+          child: ColoredBox(
+            color: colors.background,
+            child: Stack(
+              clipBehavior: Clip.none,
+              children: [
+                for (final line in lines)
+                  Positioned(
+                    left: line.left * scale,
+                    top: line.top * scale,
+                    width: _lineWidth(line, pageWidth) * scale,
+                    child: Text(
+                      line.text,
+                      maxLines: 1,
+                      overflow: TextOverflow.visible,
+                      softWrap: false,
+                      style: TextStyle(
+                        color: colors.foreground,
+                        fontFamily: _originalPdfFontFamily(line.fontName),
+                        fontSize: _pdfLineFontSize(line, scale, fontScale),
+                        height: 1,
+                        fontWeight: line.bold
+                            ? FontWeight.w700
+                            : FontWeight.w400,
+                        fontStyle: line.italic
+                            ? FontStyle.italic
+                            : FontStyle.normal,
+                      ),
                     ),
                   ),
-                ),
-            ],
+              ],
+            ),
           ),
         );
       },
@@ -1124,24 +1095,74 @@ class _PdfPageCanvas extends StatelessWidget {
     if (line.width <= 0) {
       return remaining;
     }
-    final paragraphLike = line.text.length > 80;
-    return paragraphLike
-        ? remaining
-        : math.min(remaining, math.max(line.width * 1.08, 32.0));
+    return math.min(remaining, math.max(line.width * 1.12, 32.0));
   }
 
-  int? _maxLinesFor(ImportedTextLine line) {
-    return line.text.length > 80 ? null : 1;
-  }
-
-  double _referenceFontSize(List<ImportedTextLine> lines) {
-    final sizes =
-        lines.map((line) => line.fontSize).where((size) => size > 0).toList()
-          ..sort();
-    if (sizes.isEmpty) {
-      return 12;
+  double _pdfLineFontSize(
+    ImportedTextLine line,
+    double scale,
+    double fallbackScale,
+  ) {
+    final text = line.text.trim();
+    final targetWidth = line.width * scale;
+    if (text.isEmpty || targetWidth <= 4) {
+      return math.max(8, line.fontSize * scale * fallbackScale);
     }
-    return sizes[sizes.length ~/ 2];
+
+    final fontFamily = _originalPdfFontFamily(line.fontName);
+    final fontWeight = line.bold ? FontWeight.w700 : FontWeight.w400;
+    final fontStyle = line.italic ? FontStyle.italic : FontStyle.normal;
+    var low = 1.0;
+    var high = math.max(18.0, targetWidth * 1.6);
+
+    for (var step = 0; step < 14; step++) {
+      final candidate = (low + high) / 2;
+      final painter = TextPainter(
+        text: TextSpan(
+          text: text,
+          style: TextStyle(
+            fontFamily: fontFamily,
+            fontSize: candidate,
+            fontWeight: fontWeight,
+            fontStyle: fontStyle,
+          ),
+        ),
+        maxLines: 1,
+        textDirection: TextDirection.ltr,
+      )..layout(maxWidth: double.infinity);
+
+      if (painter.width <= targetWidth * 1.02) {
+        low = candidate;
+      } else {
+        high = candidate;
+      }
+    }
+
+    final extractedSize = line.fontSize * scale * fallbackScale;
+    return math.max(8, math.max(low, extractedSize * 0.82));
+  }
+
+  double _pdfFontScale(List<ImportedTextLine> lines) {
+    final bodySizes =
+        lines
+            .where((line) => line.text.trim().length > 12)
+            .map((line) => line.fontSize)
+            .where((size) => size > 0)
+            .toList()
+          ..sort();
+    if (bodySizes.isEmpty) {
+      return 1;
+    }
+    final referenceSize = bodySizes[bodySizes.length ~/ 2];
+    return (14 / referenceSize).clamp(0.9, 8.0).toDouble();
+  }
+
+  String? _originalPdfFontFamily(String originalFontName) {
+    final font = originalFontName.trim();
+    if (font.isNotEmpty && font != 'Original') {
+      return font;
+    }
+    return 'Arial';
   }
 }
 
