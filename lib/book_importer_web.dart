@@ -273,13 +273,52 @@ List<ImportedTextLine> _mergeVisualGroup(
       .where((line) => _isDropCapFragment(line, bodyFontSize, parts))
       .toList();
   if (dropCaps.isEmpty) {
-    return [_mergeVisualLine(parts)];
+    return _mergeVisualRuns(parts);
   }
 
   final remaining = parts
       .where((line) => !dropCaps.contains(line))
       .toList(growable: false);
-  return [...dropCaps, if (remaining.isNotEmpty) _mergeVisualLine(remaining)];
+  return [...dropCaps, ..._mergeVisualRuns(remaining)];
+}
+
+List<ImportedTextLine> _mergeVisualRuns(List<ImportedTextLine> parts) {
+  if (parts.isEmpty) {
+    return const [];
+  }
+
+  final sorted = [...parts]..sort((a, b) => a.left.compareTo(b.left));
+  final runs = <List<ImportedTextLine>>[];
+  var current = <ImportedTextLine>[];
+
+  for (final part in sorted) {
+    if (current.isEmpty || _sameVisualFontRun(current.last, part)) {
+      current.add(part);
+    } else {
+      runs.add(current);
+      current = [part];
+    }
+  }
+  if (current.isNotEmpty) {
+    runs.add(current);
+  }
+
+  return [for (final run in runs) _mergeVisualLine(run)];
+}
+
+bool _sameVisualFontRun(ImportedTextLine previous, ImportedTextLine next) {
+  final maxFontSize = math.max(previous.fontSize, next.fontSize);
+  final sizeClose =
+      (previous.fontSize - next.fontSize).abs() <=
+      math.max(1.0, maxFontSize * 0.12);
+  return _fontRunKey(previous) == _fontRunKey(next) &&
+      previous.bold == next.bold &&
+      previous.italic == next.italic &&
+      sizeClose;
+}
+
+String _fontRunKey(ImportedTextLine line) {
+  return line.fontName.trim().toLowerCase();
 }
 
 bool _isDropCapFragment(

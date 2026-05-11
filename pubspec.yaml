@@ -12,6 +12,7 @@ dependencies:
   archive: ^3.6.1
   cupertino_icons: ^1.0.8
   syncfusion_flutter_pdf: ^33.2.5
+  google_fonts: ^8.1.0
 
 dev_dependencies:
   flutter_test:
@@ -20,3 +21,39 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/textures/crumpled_paper.png
+    - assets/textures/old_paper.jpg
+    - assets/textures/paper_brown.jpg
+    - assets/textures/paper_white.png
+  fonts:
+    - family: Merriweather
+      fonts:
+        - asset: assets/fonts/Merriweather-Regular.ttf
+    - family: Lora
+      fonts:
+        - asset: assets/fonts/Lora-Regular.ttf
+    - family: Crimson Text
+      fonts:
+        - asset: assets/fonts/CrimsonText-Regular.ttf
+    - family: Source Serif 4
+      fonts:
+        - asset: assets/fonts/SourceSerif4-Regular.ttf
+    - family: Inter
+      fonts:
+        - asset: assets/fonts/Inter-Regular.ttf
+    - family: Atkinson Hyperlegible
+      fonts:
+        - asset: assets/fonts/AtkinsonHyperlegible-Regular.ttf
+    - family: Source Sans 3
+      fonts:
+        - asset: assets/fonts/SourceSans3-Regular.ttf
+    - family: Roboto Slab
+      fonts:
+        - asset: assets/fonts/RobotoSlab-Regular.ttf
+    - family: JetBrains Mono
+      fonts:
+        - asset: assets/fonts/JetBrainsMono-Regular.ttf
+    - family: Playfair Display
+      fonts:
+        - asset: assets/fonts/PlayfairDisplay-Regular.ttf

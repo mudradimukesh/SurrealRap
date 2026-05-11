@@ -1,11 +1,247 @@
+import 'dart:async';
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:google_fonts/google_fonts.dart';
 
 import 'book_importer.dart';
+import 'error_log_persistence.dart';
 
 void main() {
-  runApp(const SurrealRapApp());
+  runZonedGuarded(
+    () {
+      WidgetsFlutterBinding.ensureInitialized();
+      AppErrorLog.instance.install();
+      runApp(const SurrealRapApp());
+    },
+    (error, stackTrace) => AppErrorLog.instance.recordError(
+      source: 'runZonedGuarded',
+      message: 'Unhandled async error escaped the Flutter zone.',
+      error: error,
+      stackTrace: stackTrace,
+    ),
+  );
+}
+
+class AppErrorLog extends ChangeNotifier {
+  AppErrorLog._();
+
+  static final AppErrorLog instance = AppErrorLog._();
+  static const int _maxEntries = 80;
+
+  final List<String> _entries = [];
+  bool _installed = false;
+  bool _notifyScheduled = false;
+
+  List<String> get entries => List.unmodifiable(_entries);
+
+  String get document {
+    final latestError = _entries.cast<String?>().firstWhere(
+      (entry) => entry?.contains('[ERROR]') ?? false,
+      orElse: () => null,
+    );
+    final buffer = StringBuffer()
+      ..writeln('SurrealRap Crash Log Document')
+      ..writeln('Generated: ${DateTime.now().toIso8601String()}')
+      ..writeln('Storage key: surreal_rap_error_log_v1')
+      ..writeln()
+      ..writeln('Entries: ${_entries.length}')
+      ..writeln();
+    if (_entries.isEmpty) {
+      buffer.writeln('No errors have been captured yet.');
+      return buffer.toString();
+    }
+    if (latestError != null) {
+      buffer
+        ..writeln('Latest Application Error')
+        ..writeln(latestError)
+        ..writeln();
+    }
+    for (var index = 0; index < _entries.length; index++) {
+      buffer
+        ..writeln('--- Entry ${index + 1} ---')
+        ..writeln(_entries[index])
+        ..writeln();
+    }
+    return buffer.toString();
+  }
+
+  void install() {
+    if (_installed) {
+      return;
+    }
+    _installed = true;
+    _entries
+      ..clear()
+      ..addAll(loadPersistedErrorLog());
+
+    final previousFlutterError = FlutterError.onError;
+    FlutterError.onError = (details) {
+      recordFlutterError(details, source: 'FlutterError.onError');
+      if (previousFlutterError != null) {
+        previousFlutterError(details);
+      } else {
+        FlutterError.presentError(details);
+      }
+    };
+
+    final previousPlatformError = ui.PlatformDispatcher.instance.onError;
+    ui.PlatformDispatcher.instance.onError = (error, stackTrace) {
+      recordError(
+        source: 'PlatformDispatcher.onError',
+        message: 'Unhandled platform or render pipeline error.',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      return previousPlatformError?.call(error, stackTrace) ?? true;
+    };
+
+    final previousErrorWidgetBuilder = ErrorWidget.builder;
+    ErrorWidget.builder = (details) {
+      recordFlutterError(details, source: 'ErrorWidget.builder');
+      return previousErrorWidgetBuilder(details);
+    };
+
+    installBrowserErrorCapture((source, message, stack) {
+      recordError(source: source, message: message, stack: stack);
+    });
+
+    recordEvent(
+      source: 'app.error_log.install',
+      message: 'Crash logging installed.',
+    );
+  }
+
+  void recordFlutterError(
+    FlutterErrorDetails details, {
+    required String source,
+  }) {
+    recordError(
+      source: source,
+      message: details.exceptionAsString(),
+      error: details.exception,
+      stackTrace: details.stack,
+      context: details.context?.toStringDeep(),
+      library: details.library,
+    );
+  }
+
+  void recordTextureRequest({
+    required ReaderTexture from,
+    required ReaderTexture to,
+    required Book book,
+    required int pageIndex,
+  }) {
+    recordEvent(
+      source: 'reader.texture.change.requested',
+      message: [
+        'From: ${from.name}',
+        'To: ${to.name}',
+        'Texture image: ${_textureImagePathForLog(to) ?? 'none'}',
+        'Book: ${book.title}',
+        'Format: ${book.format}',
+        'Imported: ${book.sourceUrl == null ? 'no' : 'yes'}',
+        'Page: ${pageIndex + 1} of ${book.pages.length}',
+        'Formatted pages: ${book.formattedPages.length}',
+      ].join('\n'),
+      stack: _trimStack(StackTrace.current, maxLines: 18),
+    );
+  }
+
+  void recordTextureApplied({
+    required ReaderTexture texture,
+    required Book book,
+    required int pageIndex,
+  }) {
+    recordEvent(
+      source: 'reader.texture.change.applied',
+      message: [
+        'Texture: ${texture.name}',
+        'Texture image: ${_textureImagePathForLog(texture) ?? 'none'}',
+        'Book: ${book.title}',
+        'Page: ${pageIndex + 1} of ${book.pages.length}',
+      ].join('\n'),
+      stack: _trimStack(StackTrace.current, maxLines: 18),
+    );
+  }
+
+  void recordEvent({
+    required String source,
+    required String message,
+    String? stack,
+  }) {
+    _addEntry(severity: 'INFO', source: source, message: message, stack: stack);
+  }
+
+  void recordError({
+    required String source,
+    required String message,
+    Object? error,
+    StackTrace? stackTrace,
+    String? stack,
+    String? context,
+    String? library,
+  }) {
+    _addEntry(
+      severity: 'ERROR',
+      source: source,
+      message: [
+        message,
+        if (error != null) 'Dart exception type: ${error.runtimeType}',
+        if (library != null && library.isNotEmpty) 'Library: $library',
+        if (context != null && context.trim().isNotEmpty) 'Context:\n$context',
+        if (error != null) 'Error: $error',
+      ].join('\n'),
+      stack: stack ?? _trimStack(stackTrace ?? StackTrace.current),
+    );
+  }
+
+  void clear() {
+    _entries.clear();
+    clearPersistedErrorLog();
+    notifyListeners();
+  }
+
+  void _addEntry({
+    required String severity,
+    required String source,
+    required String message,
+    String? stack,
+  }) {
+    final entry = [
+      '${DateTime.now().toIso8601String()} [$severity] $source',
+      message,
+      if (stack != null && stack.trim().isNotEmpty) 'Stack:\n$stack',
+    ].join('\n');
+    _entries.insert(0, entry);
+    if (_entries.length > _maxEntries) {
+      _entries.removeRange(_maxEntries, _entries.length);
+    }
+    savePersistedErrorLog(_entries);
+    debugPrint(entry);
+    _scheduleNotifyListeners();
+  }
+
+  void _scheduleNotifyListeners() {
+    if (_notifyScheduled) {
+      return;
+    }
+    _notifyScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _notifyScheduled = false;
+      notifyListeners();
+    });
+  }
+
+  String? _trimStack(StackTrace? stackTrace, {int maxLines = 80}) {
+    if (stackTrace == null) {
+      return null;
+    }
+    final lines = stackTrace.toString().trim().split('\n');
+    return lines.take(maxLines).join('\n');
+  }
 }
 
 class SurrealRapApp extends StatelessWidget {
@@ -30,6 +266,523 @@ class SurrealRapApp extends StatelessWidget {
 }
 
 enum ReaderTheme { night, paper, sepia }
+
+enum ReaderTexture {
+  none,
+  paper,
+  paperBackground,
+  oldPaper,
+  whitePaper,
+  watercolor,
+  kraft,
+  vintage,
+  blackPaper,
+  torn,
+  crumpled,
+  brownPaper,
+  folded,
+  ripped,
+  grunge,
+  recycled,
+  craft,
+  linen,
+  overlay,
+  greenPaper,
+  rough,
+  redPaper,
+  bluePaper,
+  glued,
+  japanese,
+  construction,
+  notebook,
+  wrinkled,
+  handmade,
+  yellowPaper,
+  greyPaper,
+  newspaper,
+  marbled,
+  charcoal,
+}
+
+class ReaderTextureOption {
+  const ReaderTextureOption({
+    required this.value,
+    required this.label,
+    required this.description,
+  });
+
+  final ReaderTexture value;
+  final String label;
+  final String description;
+}
+
+const List<ReaderTextureOption> readerTextureOptions = [
+  ReaderTextureOption(
+    value: ReaderTexture.none,
+    label: 'None',
+    description: 'Flat page color',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.paper,
+    label: 'Paper Texture',
+    description: 'Fine artistic grain',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.paperBackground,
+    label: 'Paper Background',
+    description: 'Soft full-page paper wash',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.oldPaper,
+    label: 'Old Paper',
+    description: 'Aged fibers and stains',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.whitePaper,
+    label: 'White Paper',
+    description: 'Clean bright paper tooth',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.watercolor,
+    label: 'Watercolor Paper',
+    description: 'Washed handmade-paper tone',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.kraft,
+    label: 'Kraft Paper',
+    description: 'Coarse brown stock',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.vintage,
+    label: 'Vintage Paper',
+    description: 'Retro aged paper marks',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.blackPaper,
+    label: 'Black Paper',
+    description: 'Dark art-paper fibers',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.torn,
+    label: 'Torn Paper',
+    description: 'Irregular torn edges',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.crumpled,
+    label: 'Crumpled Paper',
+    description: 'Soft crushed facets',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.brownPaper,
+    label: 'Brown Paper',
+    description: 'Warm brown recycled stock',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.folded,
+    label: 'Folded Paper',
+    description: 'Visible fold creases',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.ripped,
+    label: 'Ripped Paper',
+    description: 'Rough ripped fiber edge',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.grunge,
+    label: 'Grunge Paper',
+    description: 'Distressed speckled paper',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.recycled,
+    label: 'Recycled Paper',
+    description: 'Flecks and uneven pulp',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.craft,
+    label: 'Craft Paper',
+    description: 'Textured handmade craft stock',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.linen,
+    label: 'Linen Paper',
+    description: 'Subtle woven paper fibers',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.overlay,
+    label: 'Paper Texture Overlay',
+    description: 'Transparent overlay grain',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.greenPaper,
+    label: 'Green Paper',
+    description: 'Muted green paper texture',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.rough,
+    label: 'Rough Paper',
+    description: 'Heavy rough tooth',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.redPaper,
+    label: 'Red Paper',
+    description: 'Muted red paper texture',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.bluePaper,
+    label: 'Blue Paper',
+    description: 'Muted blue paper texture',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.glued,
+    label: 'Glued Paper',
+    description: 'Paste streaks and paper drag',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.japanese,
+    label: 'Japanese Paper',
+    description: 'Long handmade fibers',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.construction,
+    label: 'Construction Paper',
+    description: 'Colored classroom paper tooth',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.notebook,
+    label: 'Notebook Paper',
+    description: 'Ruled notebook background',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.wrinkled,
+    label: 'Wrinkled Paper',
+    description: 'Fine wrinkle map',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.handmade,
+    label: 'Handmade Paper',
+    description: 'Pulp flecks and fiber strands',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.yellowPaper,
+    label: 'Yellow Paper',
+    description: 'Soft yellow paper texture',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.greyPaper,
+    label: 'Grey Paper',
+    description: 'Neutral grey paper texture',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.newspaper,
+    label: 'News Paper',
+    description: 'Subtle newsprint columns',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.marbled,
+    label: 'Marbled',
+    description: 'Light flowing paper veins',
+  ),
+  ReaderTextureOption(
+    value: ReaderTexture.charcoal,
+    label: 'Charcoal',
+    description: 'Dark speckled art paper',
+  ),
+];
+
+class ReaderFontOption {
+  const ReaderFontOption({
+    required this.label,
+    this.family,
+    required this.description,
+  });
+
+  final String label;
+  final String? family;
+  final String description;
+}
+
+const List<ReaderFontOption> readerFontOptions = [
+  ReaderFontOption(
+    label: 'Original',
+    description: 'Match imported PDF fonts to the closest bundled family',
+  ),
+  ReaderFontOption(
+    label: 'Merriweather',
+    family: 'Merriweather',
+    description: 'Serif, warm long-form reading',
+  ),
+  ReaderFontOption(
+    label: 'Lora',
+    family: 'Lora',
+    description: 'Serif, literary and balanced',
+  ),
+  ReaderFontOption(
+    label: 'Crimson Text',
+    family: 'Crimson Text',
+    description: 'Classic book-style serif',
+  ),
+  ReaderFontOption(
+    label: 'Source Serif 4',
+    family: 'Source Serif 4',
+    description: 'Editorial serif with broad coverage',
+  ),
+  ReaderFontOption(
+    label: 'Inter',
+    family: 'Inter',
+    description: 'Clean modern sans',
+  ),
+  ReaderFontOption(
+    label: 'Atkinson Hyperlegible',
+    family: 'Atkinson Hyperlegible',
+    description: 'Accessibility-focused sans',
+  ),
+  ReaderFontOption(
+    label: 'Source Sans 3',
+    family: 'Source Sans 3',
+    description: 'Readable humanist sans',
+  ),
+  ReaderFontOption(
+    label: 'Roboto Slab',
+    family: 'Roboto Slab',
+    description: 'Sturdy slab serif',
+  ),
+  ReaderFontOption(
+    label: 'JetBrains Mono',
+    family: 'JetBrains Mono',
+    description: 'Monospace',
+  ),
+  ReaderFontOption(
+    label: 'Playfair Display',
+    family: 'Playfair Display',
+    description: 'Display serif for dramatic reading',
+  ),
+];
+
+const List<String> featuredGoogleReaderFonts = [
+  'Libre Baskerville',
+  'EB Garamond',
+  'Cormorant Garamond',
+  'Literata',
+  'Noto Serif',
+  'Noto Sans',
+  'Roboto',
+  'Open Sans',
+  'Lato',
+  'Montserrat',
+  'Cascadia Code',
+  'Cascadia Mono',
+];
+
+final allGoogleFonts = GoogleFonts.asMap();
+
+final List<ReaderFontOption> allReaderFontOptions = _buildReaderFontOptions();
+
+List<ReaderFontOption> _buildReaderFontOptions() {
+  final seen = <String>{for (final option in readerFontOptions) option.label};
+  final featured = <ReaderFontOption>[
+    for (final fontName in featuredGoogleReaderFonts)
+      if (allGoogleFonts.containsKey(fontName) && seen.add(fontName))
+        ReaderFontOption(
+          label: fontName,
+          description: fontName.startsWith('Cascadia')
+              ? 'Microsoft open-source family via Google Fonts'
+              : 'Google Fonts open-source family',
+        ),
+  ];
+  final rest =
+      allGoogleFonts.keys
+          .where((fontName) => seen.add(fontName))
+          .map(
+            (fontName) => ReaderFontOption(
+              label: fontName,
+              description: 'Google Fonts open-source family',
+            ),
+          )
+          .toList()
+        ..sort(
+          (a, b) => a.label.toLowerCase().compareTo(b.label.toLowerCase()),
+        );
+  return [...readerFontOptions, ...featured, ...rest];
+}
+
+String? _readerFontFamilyFor(String label) {
+  for (final option in readerFontOptions) {
+    if (option.label == label) {
+      return option.family;
+    }
+  }
+  return null;
+}
+
+bool _isGoogleReaderFont(String label) => allGoogleFonts.containsKey(label);
+
+TextStyle _readerFontStyle({
+  required String selectedFont,
+  String? originalFontFamily,
+  Color? color,
+  double? fontSize,
+  double? height,
+  FontWeight? fontWeight,
+  FontStyle? fontStyle,
+}) {
+  final baseStyle = TextStyle(
+    color: color,
+    fontSize: fontSize,
+    height: height,
+    fontWeight: fontWeight,
+    fontStyle: fontStyle,
+  );
+  final bundledFamily = _readerFontFamilyFor(selectedFont);
+  if (bundledFamily != null) {
+    return baseStyle.copyWith(fontFamily: bundledFamily);
+  }
+  if (_isGoogleReaderFont(selectedFont)) {
+    return GoogleFonts.getFont(selectedFont, textStyle: baseStyle);
+  }
+  return baseStyle.copyWith(fontFamily: originalFontFamily);
+}
+
+String? _measurementFontFamily({
+  required String selectedFont,
+  String? originalFontFamily,
+}) {
+  final bundledFamily = _readerFontFamilyFor(selectedFont);
+  if (bundledFamily != null) {
+    return bundledFamily;
+  }
+  if (_isGoogleReaderFont(selectedFont)) {
+    return GoogleFonts.getFont(selectedFont).fontFamily;
+  }
+  return originalFontFamily;
+}
+
+String _normalizedPdfFontName(String fontName) {
+  return fontName
+      .replaceFirst(RegExp(r'^[A-Z]{6}\+'), '')
+      .replaceAll(RegExp(r'[_-]'), ' ')
+      .replaceAll(RegExp(r'(?<=[a-z])(?=[A-Z])'), ' ')
+      .replaceAll(RegExp(r'[^a-zA-Z0-9 ]'), ' ')
+      .toLowerCase()
+      .replaceAll(RegExp(r'\b(ps|mt|std|pro|regular|roman|book)\b'), ' ')
+      .replaceAll(RegExp(r'\s+'), ' ')
+      .trim();
+}
+
+String _bestBundledFontForPdf(String originalFontName) {
+  final normalized = _normalizedPdfFontName(originalFontName);
+  if (normalized.isEmpty || normalized == 'original') {
+    return 'Lora';
+  }
+
+  final exactMatch = <String, String>{
+    for (final option in readerFontOptions)
+      if (option.family != null)
+        _normalizedPdfFontName(option.label): option.family!,
+  }[normalized];
+  if (exactMatch != null) {
+    return exactMatch;
+  }
+
+  if (_containsAny(normalized, const [
+    'mono',
+    'code',
+    'courier',
+    'consolas',
+    'menlo',
+    'monaco',
+    'terminal',
+    'typewriter',
+  ])) {
+    return 'JetBrains Mono';
+  }
+  if (_containsAny(normalized, const [
+    'hyperlegible',
+    'dyslexic',
+    'accessibility',
+  ])) {
+    return 'Atkinson Hyperlegible';
+  }
+  if (_containsAny(normalized, const [
+    'slab',
+    'rockwell',
+    'clarendon',
+    'egyptian',
+  ])) {
+    return 'Roboto Slab';
+  }
+  if (_containsAny(normalized, const [
+    'didot',
+    'bodoni',
+    'display',
+    'poster',
+    'title',
+    'headline',
+    'fatface',
+    'cinzel',
+    'abril',
+  ])) {
+    return 'Playfair Display';
+  }
+  if (_containsAny(normalized, const [
+    'garamond',
+    'baskerville',
+    'caslon',
+    'palatino',
+    'minion',
+    'jenson',
+    'sabon',
+    'cochin',
+    'hoefler',
+    'bookman',
+    'charter',
+    'times',
+    'serif',
+  ])) {
+    return 'Crimson Text';
+  }
+  if (_containsAny(normalized, const [
+    'helvetica',
+    'arial',
+    'avenir',
+    'futura',
+    'gotham',
+    'frutiger',
+    'myriad',
+    'verdana',
+    'tahoma',
+    'segoe',
+    'optima',
+    'sans',
+  ])) {
+    return 'Source Sans 3';
+  }
+
+  const fallbackFamilies = [
+    'Lora',
+    'Source Sans 3',
+    'Crimson Text',
+    'Source Serif 4',
+    'Inter',
+    'Roboto Slab',
+    'Playfair Display',
+  ];
+  return fallbackFamilies[_stableFontBucket(
+    normalized,
+    fallbackFamilies.length,
+  )];
+}
+
+bool _containsAny(String value, List<String> needles) {
+  return needles.any((needle) => value.contains(needle));
+}
+
+int _stableFontBucket(String value, int bucketCount) {
+  var hash = 0;
+  for (final codeUnit in value.codeUnits) {
+    hash = (hash * 31 + codeUnit) & 0x7fffffff;
+  }
+  return hash % bucketCount;
+}
 
 class Book {
   const Book({
@@ -84,6 +837,7 @@ class _SurrealRapHomeState extends State<SurrealRapHome> {
   double _lineHeight = 1.45;
   double _readerProgress = 0.38;
   ReaderTheme _readerTheme = ReaderTheme.night;
+  ReaderTexture _readerTexture = ReaderTexture.none;
   String _readerMode = 'Paged';
   String _readerFontFamily = 'Original';
 
@@ -187,6 +941,48 @@ class _SurrealRapHomeState extends State<SurrealRapHome> {
     });
   }
 
+  void _changeReaderTexture(ReaderTexture value) {
+    final previous = _readerTexture;
+    final book = _books[_selectedBook];
+    AppErrorLog.instance.recordTextureRequest(
+      from: previous,
+      to: value,
+      book: book,
+      pageIndex: _readerPage,
+    );
+    try {
+      setState(() => _readerTexture = value);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        try {
+          if (!mounted) {
+            return;
+          }
+          AppErrorLog.instance.recordTextureApplied(
+            texture: _readerTexture,
+            book: _books[_selectedBook],
+            pageIndex: _readerPage,
+          );
+        } catch (error, stackTrace) {
+          AppErrorLog.instance.recordError(
+            source: 'reader.texture.change.postFrame',
+            message: 'Texture change failed after the next Flutter frame.',
+            error: error,
+            stackTrace: stackTrace,
+          );
+          rethrow;
+        }
+      });
+    } catch (error, stackTrace) {
+      AppErrorLog.instance.recordError(
+        source: 'reader.texture.change.setState',
+        message: 'Texture change failed during setState.',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      rethrow;
+    }
+  }
+
   Future<void> _importBook() async {
     try {
       final imported = await pickBookFile();
@@ -222,6 +1018,24 @@ class _SurrealRapHomeState extends State<SurrealRapHome> {
       }
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(error.message ?? 'Import is unavailable here.')),
+      );
+      AppErrorLog.instance.recordError(
+        source: 'book.import.unsupported',
+        message: error.message ?? 'Import is unavailable here.',
+        error: error,
+      );
+    } catch (error, stackTrace) {
+      AppErrorLog.instance.recordError(
+        source: 'book.import.failed',
+        message: 'Book import failed.',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Import failed. See Crash Log Document.')),
       );
     }
   }
@@ -276,6 +1090,7 @@ class _SurrealRapHomeState extends State<SurrealRapHome> {
                               lineHeight: _lineHeight,
                               fontFamily: _readerFontFamily,
                               theme: _readerTheme,
+                              texture: _readerTexture,
                               mode: _readerMode,
                               highlights: _highlights,
                               highlightController: _highlightController,
@@ -297,6 +1112,7 @@ class _SurrealRapHomeState extends State<SurrealRapHome> {
                                   setState(() => _readerFontFamily = value),
                               onThemeChanged: (value) =>
                                   setState(() => _readerTheme = value),
+                              onTextureChanged: _changeReaderTexture,
                               onModeChanged: (value) =>
                                   setState(() => _readerMode = value),
                               onAddHighlight: _addHighlight,
@@ -531,6 +1347,7 @@ class _ReaderView extends StatelessWidget {
     required this.lineHeight,
     required this.fontFamily,
     required this.theme,
+    required this.texture,
     required this.mode,
     required this.highlights,
     required this.highlightController,
@@ -540,6 +1357,7 @@ class _ReaderView extends StatelessWidget {
     required this.onLineHeightChanged,
     required this.onFontFamilyChanged,
     required this.onThemeChanged,
+    required this.onTextureChanged,
     required this.onModeChanged,
     required this.onAddHighlight,
   });
@@ -551,6 +1369,7 @@ class _ReaderView extends StatelessWidget {
   final double lineHeight;
   final String fontFamily;
   final ReaderTheme theme;
+  final ReaderTexture texture;
   final String mode;
   final List<String> highlights;
   final TextEditingController highlightController;
@@ -560,6 +1379,7 @@ class _ReaderView extends StatelessWidget {
   final ValueChanged<double> onLineHeightChanged;
   final ValueChanged<String> onFontFamilyChanged;
   final ValueChanged<ReaderTheme> onThemeChanged;
+  final ValueChanged<ReaderTexture> onTextureChanged;
   final ValueChanged<String> onModeChanged;
   final VoidCallback onAddHighlight;
 
@@ -633,6 +1453,7 @@ class _ReaderView extends StatelessWidget {
                 fontSize: fontSize,
                 lineHeight: lineHeight,
                 fontFamily: fontFamily,
+                texture: texture,
                 progress: progress,
                 onProgressChanged: onProgressChanged,
                 onPageChanged: onPageChanged,
@@ -641,11 +1462,13 @@ class _ReaderView extends StatelessWidget {
                 fontSize: fontSize,
                 lineHeight: lineHeight,
                 fontFamily: fontFamily,
+                texture: texture,
                 highlights: highlights,
                 highlightController: highlightController,
                 onFontChanged: onFontChanged,
                 onLineHeightChanged: onLineHeightChanged,
                 onFontFamilyChanged: onFontFamilyChanged,
+                onTextureChanged: onTextureChanged,
                 onAddHighlight: onAddHighlight,
               );
 
@@ -792,6 +1615,930 @@ class _ReaderColors {
   final Color foreground;
 }
 
+class _ReaderTextureSurface extends StatelessWidget {
+  const _ReaderTextureSurface({
+    required this.colors,
+    required this.texture,
+    required this.child,
+  });
+
+  final _ReaderColors colors;
+  final ReaderTexture texture;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    if (texture == ReaderTexture.none) {
+      return child;
+    }
+    final textureImage = _textureImageFor(texture);
+    return Stack(
+      fit: StackFit.passthrough,
+      children: [
+        if (textureImage != null) ...[
+          Positioned.fill(
+            child: Opacity(
+              opacity: textureImage.opacity,
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  image: DecorationImage(
+                    image: ResizeImage(
+                      AssetImage(textureImage.path),
+                      width: 128,
+                      height: 128,
+                    ),
+                    fit: BoxFit.cover,
+                    filterQuality: FilterQuality.low,
+                    colorFilter: textureImage.color == null
+                        ? null
+                        : ColorFilter.mode(
+                            textureImage.color!,
+                            textureImage.blendMode,
+                          ),
+                    onError: (error, stackTrace) {
+                      AppErrorLog.instance.recordError(
+                        source: 'reader.texture.image.load',
+                        message: [
+                          'Texture image failed to load.',
+                          'Texture: ${texture.name}',
+                          'Path: ${textureImage.path}',
+                        ].join('\n'),
+                        error: error,
+                        stackTrace: stackTrace,
+                      );
+                    },
+                  ),
+                ),
+              ),
+            ),
+          ),
+          if (textureImage.backgroundWashAlpha > 0)
+            Positioned.fill(
+              child: ColoredBox(
+                color: colors.background.withValues(
+                  alpha: textureImage.backgroundWashAlpha,
+                ),
+              ),
+            ),
+        ],
+        RepaintBoundary(child: child),
+      ],
+    );
+  }
+
+  _ReaderTextureImage? _textureImageFor(ReaderTexture texture) {
+    return switch (texture) {
+      ReaderTexture.none => null,
+      ReaderTexture.paper ||
+      ReaderTexture.paperBackground ||
+      ReaderTexture.whitePaper ||
+      ReaderTexture.watercolor ||
+      ReaderTexture.linen ||
+      ReaderTexture.overlay ||
+      ReaderTexture.rough ||
+      ReaderTexture.glued ||
+      ReaderTexture.japanese ||
+      ReaderTexture.notebook ||
+      ReaderTexture.handmade ||
+      ReaderTexture.greyPaper ||
+      ReaderTexture.marbled => const _ReaderTextureImage(
+        path: 'assets/textures/paper_white.png',
+        opacity: 0.34,
+        backgroundWashAlpha: 0.18,
+      ),
+      ReaderTexture.oldPaper ||
+      ReaderTexture.vintage ||
+      ReaderTexture.yellowPaper ||
+      ReaderTexture.newspaper => const _ReaderTextureImage(
+        path: 'assets/textures/old_paper.jpg',
+        opacity: 0.42,
+        backgroundWashAlpha: 0.16,
+      ),
+      ReaderTexture.kraft ||
+      ReaderTexture.brownPaper ||
+      ReaderTexture.recycled ||
+      ReaderTexture.craft ||
+      ReaderTexture.construction => const _ReaderTextureImage(
+        path: 'assets/textures/paper_brown.jpg',
+        opacity: 0.38,
+        backgroundWashAlpha: 0.18,
+      ),
+      ReaderTexture.crumpled ||
+      ReaderTexture.torn ||
+      ReaderTexture.folded ||
+      ReaderTexture.ripped ||
+      ReaderTexture.wrinkled ||
+      ReaderTexture.grunge => const _ReaderTextureImage(
+        path: 'assets/textures/crumpled_paper.png',
+        opacity: 0.5,
+        backgroundWashAlpha: 0.1,
+      ),
+      ReaderTexture.blackPaper ||
+      ReaderTexture.charcoal => const _ReaderTextureImage(
+        path: 'assets/textures/crumpled_paper.png',
+        opacity: 0.48,
+        color: Color(0xFF151515),
+        blendMode: BlendMode.modulate,
+        backgroundWashAlpha: 0.08,
+      ),
+      ReaderTexture.greenPaper => const _ReaderTextureImage(
+        path: 'assets/textures/paper_white.png',
+        opacity: 0.38,
+        color: Color(0xFF6D9172),
+        blendMode: BlendMode.modulate,
+        backgroundWashAlpha: 0.14,
+      ),
+      ReaderTexture.redPaper => const _ReaderTextureImage(
+        path: 'assets/textures/paper_white.png',
+        opacity: 0.38,
+        color: Color(0xFFC76565),
+        blendMode: BlendMode.modulate,
+        backgroundWashAlpha: 0.14,
+      ),
+      ReaderTexture.bluePaper => const _ReaderTextureImage(
+        path: 'assets/textures/paper_white.png',
+        opacity: 0.38,
+        color: Color(0xFF668AC4),
+        blendMode: BlendMode.modulate,
+        backgroundWashAlpha: 0.14,
+      ),
+    };
+  }
+}
+
+class _ReaderPageTextureSurface extends StatelessWidget {
+  const _ReaderPageTextureSurface({
+    required this.colors,
+    required this.texture,
+    required this.child,
+  });
+
+  final _ReaderColors colors;
+  final ReaderTexture texture;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final texturePath = _textureImagePathForLog(texture);
+    final background = _readerPageBackgroundForTexture(colors, texture);
+    if (texturePath == null) {
+      return ColoredBox(color: background, child: child);
+    }
+
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        ColoredBox(color: background),
+        Opacity(
+          opacity: _readerPageTextureOpacity(texture),
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              image: DecorationImage(
+                image: AssetImage(texturePath),
+                fit: BoxFit.cover,
+                alignment: Alignment.center,
+                filterQuality: FilterQuality.medium,
+                colorFilter: _readerPageTextureFilter(texture),
+                onError: (error, stackTrace) {
+                  AppErrorLog.instance.recordError(
+                    source: 'reader.page.texture.image.load',
+                    message: [
+                      'Page texture image failed to load.',
+                      'Texture: ${texture.name}',
+                      'Path: $texturePath',
+                    ].join('\n'),
+                    error: error,
+                    stackTrace: stackTrace,
+                  );
+                },
+              ),
+            ),
+          ),
+        ),
+        if (_readerPageTextureWash(texture) case final wash?)
+          ColoredBox(color: wash),
+        RepaintBoundary(child: child),
+      ],
+    );
+  }
+}
+
+class _ReaderTextureImage {
+  const _ReaderTextureImage({
+    required this.path,
+    required this.opacity,
+    this.color,
+    this.blendMode = BlendMode.modulate,
+    this.backgroundWashAlpha = 0,
+  });
+
+  final String path;
+  final double opacity;
+  final Color? color;
+  final BlendMode blendMode;
+  final double backgroundWashAlpha;
+}
+
+String? _textureImagePathForLog(ReaderTexture texture) {
+  return switch (texture) {
+    ReaderTexture.none => null,
+    ReaderTexture.paper ||
+    ReaderTexture.paperBackground ||
+    ReaderTexture.whitePaper ||
+    ReaderTexture.watercolor ||
+    ReaderTexture.linen ||
+    ReaderTexture.overlay ||
+    ReaderTexture.rough ||
+    ReaderTexture.glued ||
+    ReaderTexture.japanese ||
+    ReaderTexture.notebook ||
+    ReaderTexture.handmade ||
+    ReaderTexture.greyPaper ||
+    ReaderTexture.marbled ||
+    ReaderTexture.greenPaper ||
+    ReaderTexture.redPaper ||
+    ReaderTexture.bluePaper => 'assets/textures/paper_white.png',
+    ReaderTexture.oldPaper ||
+    ReaderTexture.vintage ||
+    ReaderTexture.yellowPaper ||
+    ReaderTexture.newspaper => 'assets/textures/old_paper.jpg',
+    ReaderTexture.kraft ||
+    ReaderTexture.brownPaper ||
+    ReaderTexture.recycled ||
+    ReaderTexture.craft ||
+    ReaderTexture.construction => 'assets/textures/paper_brown.jpg',
+    ReaderTexture.crumpled ||
+    ReaderTexture.torn ||
+    ReaderTexture.folded ||
+    ReaderTexture.ripped ||
+    ReaderTexture.wrinkled ||
+    ReaderTexture.grunge ||
+    ReaderTexture.blackPaper ||
+    ReaderTexture.charcoal => 'assets/textures/crumpled_paper.png',
+  };
+}
+
+Color _readerPageBackgroundForTexture(
+  _ReaderColors colors,
+  ReaderTexture texture,
+) {
+  return switch (texture) {
+    ReaderTexture.none => colors.background,
+    ReaderTexture.blackPaper ||
+    ReaderTexture.charcoal => const Color(0xFF171615),
+    ReaderTexture.kraft ||
+    ReaderTexture.brownPaper ||
+    ReaderTexture.recycled ||
+    ReaderTexture.craft ||
+    ReaderTexture.construction => const Color(0xFFD0B28A),
+    ReaderTexture.oldPaper ||
+    ReaderTexture.vintage ||
+    ReaderTexture.yellowPaper ||
+    ReaderTexture.newspaper => const Color(0xFFE7D3A9),
+    ReaderTexture.greenPaper => const Color(0xFFDDE6D4),
+    ReaderTexture.redPaper => const Color(0xFFE9D0CF),
+    ReaderTexture.bluePaper => const Color(0xFFD9E1EF),
+    ReaderTexture.crumpled ||
+    ReaderTexture.torn ||
+    ReaderTexture.folded ||
+    ReaderTexture.ripped ||
+    ReaderTexture.wrinkled ||
+    ReaderTexture.grunge => const Color(0xFFF0E8DC),
+    ReaderTexture.paper ||
+    ReaderTexture.paperBackground ||
+    ReaderTexture.whitePaper ||
+    ReaderTexture.watercolor ||
+    ReaderTexture.linen ||
+    ReaderTexture.overlay ||
+    ReaderTexture.rough ||
+    ReaderTexture.glued ||
+    ReaderTexture.japanese ||
+    ReaderTexture.notebook ||
+    ReaderTexture.handmade ||
+    ReaderTexture.greyPaper ||
+    ReaderTexture.marbled => const Color(0xFFF3EFE5),
+  };
+}
+
+Color _readerPageForegroundForTexture(
+  _ReaderColors colors,
+  ReaderTexture texture,
+) {
+  return switch (texture) {
+    ReaderTexture.none => colors.foreground,
+    ReaderTexture.blackPaper ||
+    ReaderTexture.charcoal => const Color(0xFFE8DDC7),
+    ReaderTexture.kraft ||
+    ReaderTexture.brownPaper ||
+    ReaderTexture.recycled ||
+    ReaderTexture.craft ||
+    ReaderTexture.construction => const Color(0xFF2B1D12),
+    ReaderTexture.oldPaper ||
+    ReaderTexture.vintage ||
+    ReaderTexture.yellowPaper ||
+    ReaderTexture.newspaper => const Color(0xFF2C2117),
+    ReaderTexture.greenPaper ||
+    ReaderTexture.redPaper ||
+    ReaderTexture.bluePaper ||
+    ReaderTexture.crumpled ||
+    ReaderTexture.torn ||
+    ReaderTexture.folded ||
+    ReaderTexture.ripped ||
+    ReaderTexture.wrinkled ||
+    ReaderTexture.grunge ||
+    ReaderTexture.paper ||
+    ReaderTexture.paperBackground ||
+    ReaderTexture.whitePaper ||
+    ReaderTexture.watercolor ||
+    ReaderTexture.linen ||
+    ReaderTexture.overlay ||
+    ReaderTexture.rough ||
+    ReaderTexture.glued ||
+    ReaderTexture.japanese ||
+    ReaderTexture.notebook ||
+    ReaderTexture.handmade ||
+    ReaderTexture.greyPaper ||
+    ReaderTexture.marbled => const Color(0xFF302719),
+  };
+}
+
+double _readerPageTextureOpacity(ReaderTexture texture) {
+  return switch (texture) {
+    ReaderTexture.none => 0,
+    ReaderTexture.blackPaper || ReaderTexture.charcoal => 0.6,
+    ReaderTexture.crumpled ||
+    ReaderTexture.torn ||
+    ReaderTexture.folded ||
+    ReaderTexture.ripped ||
+    ReaderTexture.wrinkled ||
+    ReaderTexture.grunge => 0.38,
+    ReaderTexture.oldPaper ||
+    ReaderTexture.vintage ||
+    ReaderTexture.yellowPaper ||
+    ReaderTexture.newspaper => 0.74,
+    ReaderTexture.kraft ||
+    ReaderTexture.brownPaper ||
+    ReaderTexture.recycled ||
+    ReaderTexture.craft ||
+    ReaderTexture.construction => 0.7,
+    ReaderTexture.greenPaper ||
+    ReaderTexture.redPaper ||
+    ReaderTexture.bluePaper => 0.52,
+    ReaderTexture.paper ||
+    ReaderTexture.paperBackground ||
+    ReaderTexture.whitePaper ||
+    ReaderTexture.watercolor ||
+    ReaderTexture.linen ||
+    ReaderTexture.overlay ||
+    ReaderTexture.rough ||
+    ReaderTexture.glued ||
+    ReaderTexture.japanese ||
+    ReaderTexture.notebook ||
+    ReaderTexture.handmade ||
+    ReaderTexture.greyPaper ||
+    ReaderTexture.marbled => 0.58,
+  };
+}
+
+ColorFilter? _readerPageTextureFilter(ReaderTexture texture) {
+  return switch (texture) {
+    ReaderTexture.blackPaper || ReaderTexture.charcoal =>
+      const ColorFilter.mode(Color(0xFF151515), BlendMode.modulate),
+    ReaderTexture.greenPaper => const ColorFilter.mode(
+      Color(0xFF87A781),
+      BlendMode.modulate,
+    ),
+    ReaderTexture.redPaper => const ColorFilter.mode(
+      Color(0xFFC98282),
+      BlendMode.modulate,
+    ),
+    ReaderTexture.bluePaper => const ColorFilter.mode(
+      Color(0xFF879CC4),
+      BlendMode.modulate,
+    ),
+    _ => null,
+  };
+}
+
+Color? _readerPageTextureWash(ReaderTexture texture) {
+  return switch (texture) {
+    ReaderTexture.blackPaper ||
+    ReaderTexture.charcoal => Colors.black.withValues(alpha: 0.18),
+    ReaderTexture.crumpled ||
+    ReaderTexture.torn ||
+    ReaderTexture.folded ||
+    ReaderTexture.ripped ||
+    ReaderTexture.wrinkled ||
+    ReaderTexture.grunge => Colors.white.withValues(alpha: 0.24),
+    ReaderTexture.oldPaper ||
+    ReaderTexture.vintage ||
+    ReaderTexture.yellowPaper ||
+    ReaderTexture.newspaper => const Color(0xFFFFE9B8).withValues(alpha: 0.08),
+    _ => null,
+  };
+}
+
+// Kept for future procedural fallbacks; current reader textures use tiled images.
+// ignore: unused_element
+class _ReaderTexturePainter extends CustomPainter {
+  const _ReaderTexturePainter({required this.colors, required this.texture});
+
+  final _ReaderColors colors;
+  final ReaderTexture texture;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    switch (texture) {
+      case ReaderTexture.none:
+        break;
+      case ReaderTexture.paper:
+        _paintPaperGrain(canvas, size, intensity: 1);
+        break;
+      case ReaderTexture.paperBackground:
+        _paintTint(canvas, size, const Color(0xFFF7E9CF), alpha: 0.08);
+        _paintPaperGrain(canvas, size, intensity: 0.75);
+        _paintWatercolor(canvas, size, alpha: 0.01);
+        break;
+      case ReaderTexture.oldPaper:
+        _paintAgedPaper(canvas, size, const Color(0xFFC99D61), alpha: 0.12);
+        break;
+      case ReaderTexture.whitePaper:
+        _paintTint(canvas, size, Colors.white, alpha: 0.1);
+        _paintPaperGrain(canvas, size, intensity: 0.7);
+        break;
+      case ReaderTexture.watercolor:
+        _paintWatercolor(canvas, size);
+        _paintPaperGrain(canvas, size, intensity: 0.35);
+        break;
+      case ReaderTexture.kraft:
+        _paintAgedPaper(canvas, size, const Color(0xFFB97C3F), alpha: 0.18);
+        _paintRoughFiber(canvas, size, alpha: 0.05);
+        break;
+      case ReaderTexture.vintage:
+        _paintAgedPaper(canvas, size, const Color(0xFFD0A56B), alpha: 0.15);
+        _paintFoldLines(canvas, size, alpha: 0.04);
+        break;
+      case ReaderTexture.blackPaper:
+        _paintTint(canvas, size, Colors.black, alpha: 0.22);
+        _paintCharcoal(canvas, size);
+        break;
+      case ReaderTexture.torn:
+        _paintPaperGrain(canvas, size, intensity: 0.75);
+        _paintTornEdges(canvas, size, alpha: 0.07);
+        break;
+      case ReaderTexture.crumpled:
+        _paintPaperGrain(canvas, size, intensity: 0.55);
+        _paintCrumpleFacets(canvas, size, alpha: 0.06);
+        break;
+      case ReaderTexture.brownPaper:
+        _paintTint(canvas, size, const Color(0xFF8B5E34), alpha: 0.13);
+        _paintPaperGrain(canvas, size, intensity: 0.95);
+        break;
+      case ReaderTexture.folded:
+        _paintPaperGrain(canvas, size, intensity: 0.6);
+        _paintFoldLines(canvas, size, alpha: 0.07);
+        break;
+      case ReaderTexture.ripped:
+        _paintPaperGrain(canvas, size, intensity: 0.85);
+        _paintTornEdges(canvas, size, alpha: 0.1, jaggedness: 1.8);
+        break;
+      case ReaderTexture.grunge:
+        _paintPaperGrain(canvas, size, intensity: 1.25);
+        _paintGrunge(canvas, size, alpha: 0.08);
+        break;
+      case ReaderTexture.recycled:
+        _paintTint(canvas, size, const Color(0xFF9EAD78), alpha: 0.08);
+        _paintRecycledFlecks(canvas, size, alpha: 0.09);
+        break;
+      case ReaderTexture.craft:
+        _paintTint(canvas, size, const Color(0xFFC59153), alpha: 0.1);
+        _paintRoughFiber(canvas, size, alpha: 0.07);
+        break;
+      case ReaderTexture.linen:
+        _paintLinen(canvas, size);
+        _paintPaperGrain(canvas, size, intensity: 0.45);
+        break;
+      case ReaderTexture.overlay:
+        _paintPaperGrain(canvas, size, intensity: 1.15);
+        _paintFoldLines(canvas, size, alpha: 0.025);
+        break;
+      case ReaderTexture.greenPaper:
+        _paintTint(canvas, size, const Color(0xFF5E8B6B), alpha: 0.11);
+        _paintPaperGrain(canvas, size, intensity: 0.9);
+        break;
+      case ReaderTexture.rough:
+        _paintRoughFiber(canvas, size, alpha: 0.1);
+        _paintPaperGrain(canvas, size, intensity: 1.35);
+        break;
+      case ReaderTexture.redPaper:
+        _paintTint(canvas, size, const Color(0xFFB44D4D), alpha: 0.12);
+        _paintPaperGrain(canvas, size, intensity: 0.9);
+        break;
+      case ReaderTexture.bluePaper:
+        _paintTint(canvas, size, const Color(0xFF4E73A8), alpha: 0.12);
+        _paintPaperGrain(canvas, size, intensity: 0.9);
+        break;
+      case ReaderTexture.glued:
+        _paintPaperGrain(canvas, size, intensity: 0.65);
+        _paintGlueStreaks(canvas, size, alpha: 0.065);
+        break;
+      case ReaderTexture.japanese:
+        _paintTint(canvas, size, const Color(0xFFF5DFC2), alpha: 0.07);
+        _paintJapaneseFibers(canvas, size, alpha: 0.08);
+        break;
+      case ReaderTexture.construction:
+        _paintTint(canvas, size, const Color(0xFFE2B74F), alpha: 0.11);
+        _paintRoughFiber(canvas, size, alpha: 0.06);
+        break;
+      case ReaderTexture.notebook:
+        _paintTint(canvas, size, const Color(0xFFF4F7FF), alpha: 0.08);
+        _paintNotebook(canvas, size);
+        break;
+      case ReaderTexture.wrinkled:
+        _paintPaperGrain(canvas, size, intensity: 0.7);
+        _paintWrinkles(canvas, size, alpha: 0.07);
+        break;
+      case ReaderTexture.handmade:
+        _paintTint(canvas, size, const Color(0xFFF2E2C7), alpha: 0.08);
+        _paintJapaneseFibers(canvas, size, alpha: 0.06);
+        _paintRecycledFlecks(canvas, size, alpha: 0.07);
+        break;
+      case ReaderTexture.yellowPaper:
+        _paintTint(canvas, size, const Color(0xFFEBCB5E), alpha: 0.12);
+        _paintPaperGrain(canvas, size, intensity: 0.9);
+        break;
+      case ReaderTexture.greyPaper:
+        _paintTint(canvas, size, const Color(0xFF8E8E8E), alpha: 0.1);
+        _paintPaperGrain(canvas, size, intensity: 0.85);
+        break;
+      case ReaderTexture.newspaper:
+        _paintTint(canvas, size, const Color(0xFFD8D8D0), alpha: 0.09);
+        _paintNewsprint(canvas, size);
+        break;
+      case ReaderTexture.marbled:
+        _paintMarbled(canvas, size);
+        _paintPaperGrain(canvas, size, intensity: 0.25);
+        break;
+      case ReaderTexture.charcoal:
+        _paintCharcoal(canvas, size);
+        break;
+    }
+  }
+
+  void _paintPaperGrain(Canvas canvas, Size size, {required double intensity}) {
+    final dotCount = (size.width * size.height / 1700).clamp(90, 900).round();
+    for (var index = 0; index < dotCount; index++) {
+      final x = _noise(index + 11) * size.width;
+      final y = _noise(index + 37) * size.height;
+      final radius = 0.35 + _noise(index + 71) * 0.95;
+      final alpha = (0.018 + _noise(index + 101) * 0.038) * intensity;
+      final paint = Paint()
+        ..color = colors.foreground.withValues(alpha: alpha)
+        ..style = PaintingStyle.fill;
+      canvas.drawCircle(Offset(x, y), radius, paint);
+    }
+  }
+
+  void _paintTint(
+    Canvas canvas,
+    Size size,
+    Color color, {
+    required double alpha,
+  }) {
+    canvas.drawRect(
+      Offset.zero & size,
+      Paint()..color = color.withValues(alpha: alpha),
+    );
+  }
+
+  void _paintAgedPaper(
+    Canvas canvas,
+    Size size,
+    Color tint, {
+    required double alpha,
+  }) {
+    _paintTint(canvas, size, tint, alpha: alpha);
+    _paintPaperGrain(canvas, size, intensity: 1.05);
+    for (var index = 0; index < 9; index++) {
+      final center = Offset(
+        _noise(index + 201) * size.width,
+        _noise(index + 227) * size.height,
+      );
+      final radius =
+          math.min(size.width, size.height) *
+          (0.04 + _noise(index + 241) * 0.08);
+      final paint = Paint()
+        ..shader = RadialGradient(
+          colors: [
+            tint.withValues(alpha: alpha * 0.34),
+            tint.withValues(alpha: 0),
+          ],
+        ).createShader(Rect.fromCircle(center: center, radius: radius));
+      canvas.drawCircle(center, radius, paint);
+    }
+  }
+
+  void _paintLinen(Canvas canvas, Size size) {
+    final strokePaint = Paint()
+      ..color = colors.foreground.withValues(alpha: 0.025)
+      ..strokeWidth = 0.7;
+    for (var x = 0.0; x <= size.width; x += 8) {
+      canvas.drawLine(Offset(x, 0), Offset(x, size.height), strokePaint);
+    }
+    for (var y = 0.0; y <= size.height; y += 10) {
+      canvas.drawLine(Offset(0, y), Offset(size.width, y), strokePaint);
+    }
+  }
+
+  void _paintWatercolor(Canvas canvas, Size size, {double alpha = 0.018}) {
+    for (var band = 0; band < 6; band++) {
+      final y = size.height * (band + 0.5) / 6;
+      final height = size.height * (0.08 + _noise(band + 13) * 0.08);
+      final path = Path()
+        ..moveTo(0, y - height)
+        ..cubicTo(
+          size.width * 0.28,
+          y - height * (1.5 + _noise(band + 21)),
+          size.width * 0.58,
+          y + height * (0.2 + _noise(band + 29)),
+          size.width,
+          y - height * (0.6 + _noise(band + 31)),
+        )
+        ..lineTo(size.width, y + height)
+        ..cubicTo(
+          size.width * 0.65,
+          y + height * (1.2 + _noise(band + 43)),
+          size.width * 0.3,
+          y - height * (0.1 + _noise(band + 47)),
+          0,
+          y + height * (0.7 + _noise(band + 53)),
+        )
+        ..close();
+      final paint = Paint()
+        ..color = colors.foreground.withValues(alpha: alpha)
+        ..style = PaintingStyle.fill;
+      canvas.drawPath(path, paint);
+    }
+  }
+
+  void _paintRoughFiber(Canvas canvas, Size size, {required double alpha}) {
+    final paint = Paint()
+      ..color = colors.foreground.withValues(alpha: alpha)
+      ..strokeWidth = 0.7
+      ..strokeCap = StrokeCap.round;
+    final count = (size.width * size.height / 9500).clamp(40, 220).round();
+    for (var index = 0; index < count; index++) {
+      final start = Offset(
+        _noise(index + 301) * size.width,
+        _noise(index + 331) * size.height,
+      );
+      final length = 6 + _noise(index + 337) * 28;
+      final angle = _noise(index + 347) * math.pi;
+      final end =
+          start + Offset(math.cos(angle) * length, math.sin(angle) * length);
+      canvas.drawLine(start, end, paint);
+    }
+  }
+
+  void _paintTornEdges(
+    Canvas canvas,
+    Size size, {
+    required double alpha,
+    double jaggedness = 1,
+  }) {
+    final paint = Paint()
+      ..color = colors.foreground.withValues(alpha: alpha)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.4;
+    for (final edge in [0, 1]) {
+      final path = Path();
+      final isBottom = edge == 1;
+      path.moveTo(0, isBottom ? size.height - 4 : 4);
+      for (var x = 0.0; x <= size.width; x += 18) {
+        final offset = (_noise(x.round() + edge * 31) - 0.5) * 10 * jaggedness;
+        path.lineTo(x, (isBottom ? size.height - 5 : 5) + offset);
+      }
+      canvas.drawPath(path, paint);
+    }
+  }
+
+  void _paintCrumpleFacets(Canvas canvas, Size size, {required double alpha}) {
+    for (var index = 0; index < 12; index++) {
+      final x = _noise(index + 401) * size.width;
+      final y = _noise(index + 421) * size.height;
+      final path = Path()
+        ..moveTo(x, y)
+        ..lineTo(x + (_noise(index + 431) - 0.5) * size.width * 0.42, y + 40)
+        ..lineTo(x + (_noise(index + 439) - 0.5) * size.width * 0.28, y - 45);
+      final paint = Paint()
+        ..color = colors.foreground.withValues(alpha: alpha)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1;
+      canvas.drawPath(path, paint);
+    }
+  }
+
+  void _paintFoldLines(Canvas canvas, Size size, {required double alpha}) {
+    final paint = Paint()
+      ..color = colors.foreground.withValues(alpha: alpha)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.2;
+    canvas.drawLine(
+      Offset(size.width * 0.5, 0),
+      Offset(size.width * 0.5, size.height),
+      paint,
+    );
+    canvas.drawLine(
+      Offset(0, size.height * 0.38),
+      Offset(size.width, size.height * 0.38),
+      paint,
+    );
+    canvas.drawLine(
+      Offset(0, size.height * 0.72),
+      Offset(size.width, size.height * 0.68),
+      paint,
+    );
+  }
+
+  void _paintGrunge(Canvas canvas, Size size, {required double alpha}) {
+    final count = (size.width * size.height / 4200).clamp(80, 360).round();
+    for (var index = 0; index < count; index++) {
+      final center = Offset(
+        _noise(index + 501) * size.width,
+        _noise(index + 541) * size.height,
+      );
+      final radius = 1 + _noise(index + 557) * 6;
+      canvas.drawCircle(
+        center,
+        radius,
+        Paint()
+          ..color = colors.foreground.withValues(
+            alpha: alpha * _noise(index + 563),
+          ),
+      );
+    }
+  }
+
+  void _paintRecycledFlecks(Canvas canvas, Size size, {required double alpha}) {
+    final fleckColors = [
+      colors.foreground,
+      const Color(0xFF6D8B5C),
+      const Color(0xFFB78B50),
+    ];
+    final count = (size.width * size.height / 5200).clamp(70, 340).round();
+    for (var index = 0; index < count; index++) {
+      final color = fleckColors[index % fleckColors.length];
+      final rect = Rect.fromCenter(
+        center: Offset(
+          _noise(index + 601) * size.width,
+          _noise(index + 631) * size.height,
+        ),
+        width: 1 + _noise(index + 641) * 3,
+        height: 0.8 + _noise(index + 647) * 2.5,
+      );
+      canvas.drawOval(rect, Paint()..color = color.withValues(alpha: alpha));
+    }
+  }
+
+  void _paintGlueStreaks(Canvas canvas, Size size, {required double alpha}) {
+    final paint = Paint()
+      ..color = Colors.white.withValues(alpha: alpha)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 7
+      ..strokeCap = StrokeCap.round;
+    for (var index = 0; index < 7; index++) {
+      final y = size.height * (index + 0.7) / 8;
+      final path = Path()..moveTo(size.width * 0.08, y);
+      path.cubicTo(
+        size.width * 0.32,
+        y + (_noise(index + 701) - 0.5) * 48,
+        size.width * 0.62,
+        y + (_noise(index + 709) - 0.5) * 48,
+        size.width * 0.92,
+        y + (_noise(index + 719) - 0.5) * 38,
+      );
+      canvas.drawPath(path, paint);
+    }
+  }
+
+  void _paintJapaneseFibers(Canvas canvas, Size size, {required double alpha}) {
+    final paint = Paint()
+      ..color = colors.foreground.withValues(alpha: alpha)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 0.8
+      ..strokeCap = StrokeCap.round;
+    for (var index = 0; index < 90; index++) {
+      final start = Offset(
+        _noise(index + 801) * size.width,
+        _noise(index + 821) * size.height,
+      );
+      final length = 16 + _noise(index + 827) * 56;
+      final angle = -0.35 + _noise(index + 829) * 0.7;
+      canvas.drawLine(
+        start,
+        start + Offset(math.cos(angle) * length, math.sin(angle) * length),
+        paint,
+      );
+    }
+  }
+
+  void _paintNotebook(Canvas canvas, Size size) {
+    final linePaint = Paint()
+      ..color = const Color(0xFF6E9CD6).withValues(alpha: 0.18)
+      ..strokeWidth = 0.8;
+    final marginPaint = Paint()
+      ..color = const Color(0xFFE06B6B).withValues(alpha: 0.14)
+      ..strokeWidth = 0.9;
+    for (var y = 32.0; y <= size.height; y += 28) {
+      canvas.drawLine(Offset(0, y), Offset(size.width, y), linePaint);
+    }
+    canvas.drawLine(const Offset(46, 0), Offset(46, size.height), marginPaint);
+  }
+
+  void _paintWrinkles(Canvas canvas, Size size, {required double alpha}) {
+    final paint = Paint()
+      ..color = colors.foreground.withValues(alpha: alpha)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 0.9;
+    for (var index = 0; index < 18; index++) {
+      final y = _noise(index + 901) * size.height;
+      final path = Path()..moveTo(0, y);
+      for (var x = 0.0; x <= size.width; x += 34) {
+        path.lineTo(
+          x,
+          y + math.sin(x * 0.05 + index) * (4 + _noise(index + 911) * 7),
+        );
+      }
+      canvas.drawPath(path, paint);
+    }
+  }
+
+  void _paintNewsprint(Canvas canvas, Size size) {
+    final columnPaint = Paint()
+      ..color = colors.foreground.withValues(alpha: 0.035)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1;
+    for (var x = size.width / 3; x < size.width; x += size.width / 3) {
+      canvas.drawLine(Offset(x, 0), Offset(x, size.height), columnPaint);
+    }
+    for (var y = 18.0; y < size.height; y += 22) {
+      canvas.drawLine(
+        Offset(size.width * 0.06, y),
+        Offset(size.width * 0.94, y),
+        columnPaint,
+      );
+    }
+    _paintPaperGrain(canvas, size, intensity: 0.7);
+  }
+
+  void _paintMarbled(Canvas canvas, Size size) {
+    for (var line = 0; line < 9; line++) {
+      final y = size.height * (line + 0.5) / 9;
+      final path = Path()..moveTo(0, y);
+      for (var x = 0.0; x <= size.width; x += 28) {
+        final wave =
+            math.sin((x * 0.018) + line * 1.7) * (5 + line % 3 * 2) +
+            math.sin((x * 0.041) + line) * 3;
+        path.lineTo(x, y + wave);
+      }
+      final paint = Paint()
+        ..color = colors.foreground.withValues(alpha: 0.032)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.1;
+      canvas.drawPath(path, paint);
+    }
+  }
+
+  void _paintCharcoal(Canvas canvas, Size size) {
+    _paintPaperGrain(canvas, size, intensity: 1.8);
+    final paint = Paint()
+      ..color = colors.foreground.withValues(alpha: 0.03)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 16
+      ..strokeCap = StrokeCap.round;
+    for (var stroke = 0; stroke < 7; stroke++) {
+      final y = size.height * (stroke + 1) / 8;
+      canvas.drawLine(
+        Offset(size.width * 0.08, y + math.sin(stroke) * 18),
+        Offset(size.width * 0.92, y + math.cos(stroke * 1.7) * 18),
+        paint,
+      );
+    }
+  }
+
+  double _noise(int seed) {
+    final raw = math.sin(seed * 12.9898) * 43758.5453;
+    return raw - raw.floorToDouble();
+  }
+
+  @override
+  bool shouldRepaint(_ReaderTexturePainter oldDelegate) {
+    return oldDelegate.texture != texture ||
+        oldDelegate.colors.background != colors.background ||
+        oldDelegate.colors.foreground != colors.foreground;
+  }
+}
+
 class _ReadingPane extends StatelessWidget {
   const _ReadingPane({
     required this.colors,
@@ -800,6 +2547,7 @@ class _ReadingPane extends StatelessWidget {
     required this.fontSize,
     required this.lineHeight,
     required this.fontFamily,
+    required this.texture,
     required this.progress,
     required this.onProgressChanged,
     required this.onPageChanged,
@@ -811,6 +2559,7 @@ class _ReadingPane extends StatelessWidget {
   final double fontSize;
   final double lineHeight;
   final String fontFamily;
+  final ReaderTexture texture;
   final double progress;
   final ValueChanged<double> onProgressChanged;
   final ValueChanged<int> onPageChanged;
@@ -826,6 +2575,7 @@ class _ReadingPane extends StatelessWidget {
         formattedPages[clampedPage.clamp(0, formattedPages.length - 1)];
     final currentText = currentPage.text;
     final chapter = _chapterTitleFor(currentText, clampedPage);
+    final pageForeground = _readerPageForegroundForTexture(colors, texture);
 
     return DecoratedBox(
       decoration: BoxDecoration(
@@ -833,58 +2583,74 @@ class _ReadingPane extends StatelessWidget {
         borderRadius: BorderRadius.circular(8),
         border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
       ),
-      child: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(8),
+        child: _ReaderTextureSurface(
+          colors: colors,
+          texture: texture,
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Expanded(
-                  child: Text(
-                    '$chapter · Page ${clampedPage + 1} of ${pages.length}',
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      color: colors.foreground.withValues(alpha: 0.72),
-                      fontWeight: FontWeight.w700,
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        '$chapter · Page ${clampedPage + 1} of ${pages.length}',
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: pageForeground.withValues(alpha: 0.74),
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
                     ),
+                    Icon(
+                      Icons.search,
+                      size: 20,
+                      color: pageForeground.withValues(alpha: 0.86),
+                    ),
+                    const SizedBox(width: 12),
+                    Icon(
+                      Icons.tune,
+                      size: 20,
+                      color: pageForeground.withValues(alpha: 0.86),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 22),
+                _FormattedPageView(
+                  page: currentPage,
+                  colors: colors,
+                  baseFontSize: fontSize,
+                  lineHeight: lineHeight,
+                  fontFamily: fontFamily,
+                  texture: texture,
+                ),
+                const SizedBox(height: 20),
+                Slider(
+                  value: clampedPage.toDouble(),
+                  min: 0,
+                  max: (pages.length - 1).toDouble().clamp(1, double.infinity),
+                  divisions: pages.length > 1 ? pages.length - 1 : null,
+                  label: 'Page ${clampedPage + 1}',
+                  onChanged: (value) {
+                    final page = value.round().clamp(0, pages.length - 1);
+                    onPageChanged(page);
+                    onProgressChanged(
+                      pages.length <= 1 ? 0 : page / (pages.length - 1),
+                    );
+                  },
+                ),
+                Text(
+                  '${book.title} · $chapter · Page ${clampedPage + 1} of ${pages.length} · ${(progress * 100).round()}% read',
+                  style: TextStyle(
+                    color: pageForeground.withValues(alpha: 0.62),
                   ),
                 ),
-                const Icon(Icons.search, size: 20),
-                const SizedBox(width: 12),
-                const Icon(Icons.tune, size: 20),
               ],
             ),
-            const SizedBox(height: 22),
-            _FormattedPageView(
-              page: currentPage,
-              colors: colors,
-              baseFontSize: fontSize,
-              lineHeight: lineHeight,
-              fontFamily: fontFamily,
-            ),
-            const SizedBox(height: 20),
-            Slider(
-              value: clampedPage.toDouble(),
-              min: 0,
-              max: (pages.length - 1).toDouble().clamp(1, double.infinity),
-              divisions: pages.length > 1 ? pages.length - 1 : null,
-              label: 'Page ${clampedPage + 1}',
-              onChanged: (value) {
-                final page = value.round().clamp(0, pages.length - 1);
-                onPageChanged(page);
-                onProgressChanged(
-                  pages.length <= 1 ? 0 : page / (pages.length - 1),
-                );
-              },
-            ),
-            Text(
-              '${book.title} · $chapter · Page ${clampedPage + 1} of ${pages.length} · ${(progress * 100).round()}% read',
-              style: TextStyle(
-                color: colors.foreground.withValues(alpha: 0.64),
-              ),
-            ),
-          ],
+          ),
         ),
       ),
     );
@@ -917,6 +2683,7 @@ class _FormattedPageView extends StatelessWidget {
     required this.baseFontSize,
     required this.lineHeight,
     required this.fontFamily,
+    required this.texture,
   });
 
   final ImportedBookPage page;
@@ -924,6 +2691,7 @@ class _FormattedPageView extends StatelessWidget {
   final double baseFontSize;
   final double lineHeight;
   final String fontFamily;
+  final ReaderTexture texture;
 
   @override
   Widget build(BuildContext context) {
@@ -931,7 +2699,13 @@ class _FormattedPageView extends StatelessWidget {
         ? _plainLinesFor(page.text)
         : page.lines.where((line) => line.text.trim().isNotEmpty).toList();
     if (_hasOriginalPageGeometry(lines)) {
-      return _PdfPageCanvas(page: page, lines: lines, colors: colors);
+      return _PdfPageCanvas(
+        page: page,
+        lines: lines,
+        colors: colors,
+        selectedFont: fontFamily,
+        texture: texture,
+      );
     }
 
     final referenceSize = _referenceFontSize(lines);
@@ -948,9 +2722,10 @@ class _FormattedPageView extends StatelessWidget {
             ),
             child: Text(
               line.text,
-              style: TextStyle(
-                color: colors.foreground,
-                fontFamily: _resolvedFontFamily(line.fontName, fontFamily),
+              style: _readerFontStyle(
+                selectedFont: fontFamily,
+                originalFontFamily: _resolvedFontFamily(line.fontName),
+                color: _readerPageForegroundForTexture(colors, texture),
                 fontSize: _resolvedFontSize(line.fontSize, referenceSize),
                 height: lineHeight,
                 fontWeight: line.bold ? FontWeight.w700 : FontWeight.w400,
@@ -1008,20 +2783,8 @@ class _FormattedPageView extends StatelessWidget {
     return relative > 1.25 ? 12 : 7;
   }
 
-  String? _resolvedFontFamily(String originalFontName, String selected) {
-    if (selected == 'Serif') {
-      return 'Georgia';
-    }
-    if (selected == 'Sans') {
-      return 'Arial';
-    }
-    if (selected == 'Mono') {
-      return 'Menlo';
-    }
-    if (originalFontName.trim().isEmpty || originalFontName == 'Original') {
-      return 'Georgia';
-    }
-    return originalFontName;
+  String? _resolvedFontFamily(String originalFontName) {
+    return _bestBundledFontForPdf(originalFontName);
   }
 }
 
@@ -1042,11 +2805,15 @@ class _PdfPageCanvas extends StatelessWidget {
     required this.page,
     required this.lines,
     required this.colors,
+    required this.selectedFont,
+    required this.texture,
   });
 
   final ImportedBookPage page;
   final List<ImportedTextLine> lines;
   final _ReaderColors colors;
+  final String selectedFont;
+  final ReaderTexture texture;
 
   @override
   Widget build(BuildContext context) {
@@ -1077,12 +2844,14 @@ class _PdfPageCanvas extends StatelessWidget {
           (bottom, entry) => math.max(bottom, entry.top + entry.fontSize),
         );
         final canvasHeight = math.max(pageHeight * scale, contentBottom + 24);
+        final pageForeground = _readerPageForegroundForTexture(colors, texture);
 
         return SizedBox(
           width: canvasWidth,
           height: canvasHeight,
-          child: ColoredBox(
-            color: colors.background,
+          child: _ReaderPageTextureSurface(
+            colors: colors,
+            texture: texture,
             child: Stack(
               clipBehavior: Clip.none,
               children: [
@@ -1096,9 +2865,12 @@ class _PdfPageCanvas extends StatelessWidget {
                       maxLines: 1,
                       overflow: TextOverflow.visible,
                       softWrap: false,
-                      style: TextStyle(
-                        color: colors.foreground,
-                        fontFamily: _originalPdfFontFamily(entry.line.fontName),
+                      style: _readerFontStyle(
+                        selectedFont: selectedFont,
+                        originalFontFamily: _originalPdfFontFamily(
+                          entry.line.fontName,
+                        ),
+                        color: pageForeground,
                         fontSize: entry.fontSize,
                         height: 1,
                         fontWeight: entry.line.bold
@@ -1232,38 +3004,62 @@ class _PdfPageCanvas extends StatelessWidget {
           return top == 0 ? a.line.left.compareTo(b.line.left) : top;
         });
 
+    final adjusted = <_PositionedPdfLine>[];
     var floor = 0.0;
-    return [
-      for (final entry in positioned)
-        _positionedWithoutCollision(entry, pageWidth, () {
-          final adjustedTop = math.max(entry.top, floor);
-          floor = adjustedTop + entry.fontSize * 1.18;
-          return adjustedTop;
-        }),
-    ];
+    var index = 0;
+
+    while (index < positioned.length) {
+      final entry = positioned[index];
+      if (_keepsOriginalPdfPosition(entry, pageWidth)) {
+        adjusted.add(entry);
+        index++;
+        continue;
+      }
+
+      final row = <_PositionedPdfLine>[entry];
+      var rowTop = entry.top;
+      var rowMaxFontSize = entry.fontSize;
+      var nextIndex = index + 1;
+
+      while (nextIndex < positioned.length) {
+        final candidate = positioned[nextIndex];
+        if (_keepsOriginalPdfPosition(candidate, pageWidth)) {
+          break;
+        }
+        final threshold = math.max(
+          3.0,
+          math.max(rowMaxFontSize, candidate.fontSize) * 0.45,
+        );
+        if ((candidate.top - rowTop).abs() > threshold) {
+          break;
+        }
+        row.add(candidate);
+        rowTop = math.min(rowTop, candidate.top);
+        rowMaxFontSize = math.max(rowMaxFontSize, candidate.fontSize);
+        nextIndex++;
+      }
+
+      final adjustedTop = math.max(rowTop, floor);
+      for (final rowEntry in row) {
+        adjusted.add(
+          _PositionedPdfLine(
+            line: rowEntry.line,
+            top: adjustedTop + rowEntry.top - rowTop,
+            fontSize: rowEntry.fontSize,
+          ),
+        );
+      }
+      floor = adjustedTop + rowMaxFontSize * 1.18;
+      index = nextIndex;
+    }
+
+    return adjusted;
   }
 
-  _PositionedPdfLine _positionedWithoutCollision(
-    _PositionedPdfLine entry,
-    double pageWidth,
-    double Function() nextBodyTop,
-  ) {
+  bool _keepsOriginalPdfPosition(_PositionedPdfLine entry, double pageWidth) {
     final text = entry.line.text.trim();
-    final isDropCap = _isDropCapLine(text, entry.fontSize);
-    if (isDropCap) {
-      return entry;
-    }
-
-    final isHeading = _isLikelyHeadingLine(entry.line, pageWidth);
-    if (isHeading) {
-      return entry;
-    }
-
-    return _PositionedPdfLine(
-      line: entry.line,
-      top: nextBodyTop(),
-      fontSize: entry.fontSize,
-    );
+    return _isDropCapLine(text, entry.fontSize) ||
+        _isLikelyHeadingLine(entry.line, pageWidth);
   }
 
   double _lineWidth(ImportedTextLine line, double pageWidth) {
@@ -1582,7 +3378,10 @@ class _PdfPageCanvas extends StatelessWidget {
       return math.max(30, extractedSize);
     }
 
-    final fontFamily = _originalPdfFontFamily(line.fontName);
+    final fontFamily = _measurementFontFamily(
+      selectedFont: selectedFont,
+      originalFontFamily: _originalPdfFontFamily(line.fontName),
+    );
     final fontWeight = line.bold ? FontWeight.w700 : FontWeight.w400;
     final fontStyle = line.italic ? FontStyle.italic : FontStyle.normal;
     var low = 1.0;
@@ -1710,28 +3509,7 @@ class _PdfPageCanvas extends StatelessWidget {
   }
 
   String? _originalPdfFontFamily(String originalFontName) {
-    final font = originalFontName.trim();
-    if (font.isEmpty || font == 'Original') {
-      return 'Arial';
-    }
-
-    final lower = font.toLowerCase();
-    if (lower.contains('times')) {
-      return 'Times New Roman';
-    }
-    if (lower.contains('courier')) {
-      return 'Courier New';
-    }
-    if (lower.contains('helvetica') || lower.contains('arial')) {
-      return 'Arial';
-    }
-    if (lower.contains('georgia')) {
-      return 'Georgia';
-    }
-    if (lower.contains('avenir')) {
-      return 'Avenir Next';
-    }
-    return 'Arial';
+    return _bestBundledFontForPdf(originalFontName);
   }
 }
 
@@ -1760,26 +3538,31 @@ class _ReaderTools extends StatelessWidget {
     required this.fontSize,
     required this.lineHeight,
     required this.fontFamily,
+    required this.texture,
     required this.highlights,
     required this.highlightController,
     required this.onFontChanged,
     required this.onLineHeightChanged,
     required this.onFontFamilyChanged,
+    required this.onTextureChanged,
     required this.onAddHighlight,
   });
 
   final double fontSize;
   final double lineHeight;
   final String fontFamily;
+  final ReaderTexture texture;
   final List<String> highlights;
   final TextEditingController highlightController;
   final ValueChanged<double> onFontChanged;
   final ValueChanged<double> onLineHeightChanged;
   final ValueChanged<String> onFontFamilyChanged;
+  final ValueChanged<ReaderTexture> onTextureChanged;
   final VoidCallback onAddHighlight;
 
   @override
   Widget build(BuildContext context) {
+    final fontOptions = allReaderFontOptions;
     return _Panel(
       title: 'Reader Tools',
       child: Column(
@@ -1799,21 +3582,64 @@ class _ReaderTools extends StatelessWidget {
             max: 1.9,
             onChanged: onLineHeightChanged,
           ),
-          DropdownButtonFormField<String>(
-            initialValue: fontFamily,
-            decoration: const InputDecoration(
-              labelText: 'Font family',
-              border: OutlineInputBorder(),
-            ),
-            items: const [
-              DropdownMenuItem(value: 'Original', child: Text('Original')),
-              DropdownMenuItem(value: 'Serif', child: Text('Serif')),
-              DropdownMenuItem(value: 'Sans', child: Text('Sans')),
-              DropdownMenuItem(value: 'Mono', child: Text('Mono')),
+          DropdownMenu<String>(
+            initialSelection: fontFamily,
+            requestFocusOnTap: true,
+            enableFilter: true,
+            enableSearch: true,
+            expandedInsets: EdgeInsets.zero,
+            label: const Text('Font library'),
+            helperText:
+                'Type to search bundled fonts and the Google Fonts catalog',
+            dropdownMenuEntries: [
+              for (final option in fontOptions)
+                DropdownMenuEntry<String>(
+                  value: option.label,
+                  label: option.label,
+                  labelWidget: _FontMenuLabel(option: option),
+                  style: MenuItemButton.styleFrom(
+                    textStyle: TextStyle(fontFamily: option.family),
+                  ),
+                ),
             ],
-            onChanged: (value) {
+            onSelected: (value) {
               if (value != null) {
                 onFontFamilyChanged(value);
+              }
+            },
+          ),
+          const SizedBox(height: 12),
+          DropdownMenu<ReaderTexture>(
+            initialSelection: texture,
+            requestFocusOnTap: true,
+            enableFilter: true,
+            enableSearch: true,
+            expandedInsets: EdgeInsets.zero,
+            label: const Text('Background texture'),
+            helperText: 'Search Vecteezy-style paper texture types',
+            leadingIcon: const Icon(Icons.texture),
+            dropdownMenuEntries: [
+              for (final option in readerTextureOptions)
+                DropdownMenuEntry<ReaderTexture>(
+                  value: option.value,
+                  label: option.label,
+                  labelWidget: _TextureMenuLabel(option: option),
+                ),
+            ],
+            onSelected: (value) {
+              if (value != null) {
+                try {
+                  onTextureChanged(value);
+                } catch (error, stackTrace) {
+                  AppErrorLog.instance.recordError(
+                    source: 'reader.tools.texture.dropdown',
+                    message:
+                        'Texture dropdown failed while applying a selected value.',
+                    error: error,
+                    stackTrace: stackTrace,
+                  );
+                  rethrow;
+                }
               }
             },
           ),
@@ -1834,6 +3660,8 @@ class _ReaderTools extends StatelessWidget {
             label: const Text('Add Highlight'),
           ),
           const SizedBox(height: 18),
+          const _ErrorLogDocument(),
+          const SizedBox(height: 18),
           Text(
             'Annotations',
             style: Theme.of(
@@ -1845,6 +3673,73 @@ class _ReaderTools extends StatelessWidget {
             _SmallNote(icon: Icons.format_quote, text: highlight),
         ],
       ),
+    );
+  }
+}
+
+class _ErrorLogDocument extends StatelessWidget {
+  const _ErrorLogDocument();
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: AppErrorLog.instance,
+      builder: (context, _) {
+        final log = AppErrorLog.instance;
+        final color = Theme.of(context).colorScheme.onSurface;
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    'Crash Log Document',
+                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ),
+                IconButton(
+                  tooltip: 'Clear log',
+                  onPressed: log.entries.isEmpty ? null : log.clear,
+                  icon: const Icon(Icons.delete_sweep_outlined),
+                ),
+                IconButton(
+                  tooltip: 'Copy log',
+                  onPressed: log.entries.isEmpty
+                      ? null
+                      : () => Clipboard.setData(
+                          ClipboardData(text: log.document),
+                        ),
+                  icon: const Icon(Icons.copy_all_outlined),
+                ),
+              ],
+            ),
+            Container(
+              constraints: const BoxConstraints(maxHeight: 260),
+              width: double.infinity,
+              decoration: BoxDecoration(
+                border: Border.all(color: Colors.white.withValues(alpha: 0.1)),
+                borderRadius: BorderRadius.circular(8),
+                color: Colors.black.withValues(alpha: 0.16),
+              ),
+              padding: const EdgeInsets.all(12),
+              child: SingleChildScrollView(
+                child: SelectableText(
+                  log.document,
+                  style: TextStyle(
+                    color: color.withValues(alpha: 0.84),
+                    fontFamily: 'JetBrains Mono',
+                    fontSize: 12,
+                    height: 1.35,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        );
+      },
     );
   }
 }
@@ -2071,6 +3966,110 @@ class _Screen extends StatelessWidget {
         ),
       ),
     );
+  }
+}
+
+class _FontMenuLabel extends StatelessWidget {
+  const _FontMenuLabel({required this.option});
+
+  final ReaderFontOption option;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = Theme.of(context).colorScheme.onSurface;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          option.label,
+          style: TextStyle(
+            fontFamily: option.family,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+        Text(
+          option.description,
+          style: Theme.of(
+            context,
+          ).textTheme.bodySmall?.copyWith(color: color.withValues(alpha: 0.66)),
+        ),
+      ],
+    );
+  }
+}
+
+class _TextureMenuLabel extends StatelessWidget {
+  const _TextureMenuLabel({required this.option});
+
+  final ReaderTextureOption option;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = Theme.of(context).colorScheme.onSurface;
+    return Row(
+      children: [
+        Icon(_textureIcon(option.value), size: 18, color: color),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                option.label,
+                style: const TextStyle(fontWeight: FontWeight.w700),
+              ),
+              Text(
+                option.description,
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: color.withValues(alpha: 0.66),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  IconData _textureIcon(ReaderTexture texture) {
+    return switch (texture) {
+      ReaderTexture.none => Icons.layers_clear_outlined,
+      ReaderTexture.paper => Icons.grain,
+      ReaderTexture.paperBackground => Icons.wallpaper_outlined,
+      ReaderTexture.oldPaper => Icons.history_edu_outlined,
+      ReaderTexture.whitePaper => Icons.article_outlined,
+      ReaderTexture.watercolor => Icons.water_drop_outlined,
+      ReaderTexture.kraft => Icons.inventory_2_outlined,
+      ReaderTexture.vintage => Icons.history_outlined,
+      ReaderTexture.blackPaper => Icons.contrast,
+      ReaderTexture.torn => Icons.content_cut,
+      ReaderTexture.crumpled => Icons.auto_awesome_mosaic_outlined,
+      ReaderTexture.brownPaper => Icons.square,
+      ReaderTexture.folded => Icons.filter_none,
+      ReaderTexture.ripped => Icons.cut,
+      ReaderTexture.grunge => Icons.blur_on,
+      ReaderTexture.recycled => Icons.recycling,
+      ReaderTexture.craft => Icons.palette_outlined,
+      ReaderTexture.linen => Icons.grid_on,
+      ReaderTexture.overlay => Icons.layers_outlined,
+      ReaderTexture.greenPaper => Icons.eco_outlined,
+      ReaderTexture.rough => Icons.texture,
+      ReaderTexture.redPaper => Icons.square,
+      ReaderTexture.bluePaper => Icons.square,
+      ReaderTexture.glued => Icons.format_paint_outlined,
+      ReaderTexture.japanese => Icons.waves_outlined,
+      ReaderTexture.construction => Icons.construction_outlined,
+      ReaderTexture.notebook => Icons.sticky_note_2_outlined,
+      ReaderTexture.wrinkled => Icons.polyline_outlined,
+      ReaderTexture.handmade => Icons.pan_tool_alt_outlined,
+      ReaderTexture.yellowPaper => Icons.square,
+      ReaderTexture.greyPaper => Icons.square,
+      ReaderTexture.newspaper => Icons.newspaper,
+      ReaderTexture.marbled => Icons.waves,
+      ReaderTexture.charcoal => Icons.brush_outlined,
+    };
   }
 }
 
